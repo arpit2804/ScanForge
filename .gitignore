@@ -1,0 +1,5 @@
+__pycache__/
+
+vulnerabilities.db
+
+src/config.py
