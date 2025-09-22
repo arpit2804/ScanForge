@@ -3,26 +3,27 @@ import json
 import re
 import time
 import urllib.parse
-from typing import Dict, List, Any, Optional, Union
-from dataclasses import dataclass, asdict
+from typing import Dict, List, Any, Optional
+from dataclasses import dataclass
 from enum import Enum
 import aiohttp
 import logging
-from abc import ABC, abstractmethod
-import sqlite3
-from contextlib import asynccontextmanager
 import hashlib
+import sqlite3
+from bs4 import BeautifulSoup
+
+# Import the new AI Interface
+from AIInterface import AIInterface
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # =============================================================================
-# Data Models and Enums
+# Data Models and Enums (Unchanged)
 # =============================================================================
 
 class Severity(Enum):
-    """Vulnerability severity levels"""
     CRITICAL = "critical"
     HIGH = "high"
     MEDIUM = "medium"
@@ -30,39 +31,12 @@ class Severity(Enum):
     INFO = "info"
 
 class VulnType(Enum):
-    """Supported vulnerability types"""
     XSS = "xss"
     SQLI = "sqli"
     SSRF = "ssrf"
     LFI = "lfi"
     RCE = "rce"
     XXE = "xxe"
-
-@dataclass
-class InjectionPoint:
-    """Represents where to inject payloads"""
-    type: str  # query_param, form_field, header, path, body
-    name: str
-    position: Optional[int] = None
-
-@dataclass
-class HttpRequest:
-    """HTTP request representation"""
-    method: str
-    url: str
-    headers: Dict[str, str]
-    body: str = ""
-    timeout: int = 10
-
-@dataclass
-class HttpResponse:
-    """HTTP response representation"""
-    status_code: int
-    headers: Dict[str, str]
-    body: str
-    response_time: float
-    size_bytes: int
-    redirect_chain: List[str]
 
 @dataclass
 class Vulnerability:
@@ -82,1199 +56,772 @@ class Vulnerability:
             self.timestamp = time.time()
 
 # =============================================================================
-# Safety and Rate Limiting Components
+# Safety and Core Components (Enhanced with limits)
 # =============================================================================
 
 class RateLimiter:
     """Rate limiting to prevent overwhelming target servers"""
-    
     def __init__(self, requests_per_minute: int = 30):
         self.requests_per_minute = requests_per_minute
         self.requests = []
         self.lock = asyncio.Lock()
-    
+
     async def acquire(self):
-        """Acquire permission to make a request"""
         async with self.lock:
             now = time.time()
-            # Remove requests older than 1 minute
             self.requests = [req_time for req_time in self.requests if now - req_time < 60]
-            
             if len(self.requests) >= self.requests_per_minute:
-                # Wait until we can make another request
                 sleep_time = 60 - (now - self.requests[0])
                 if sleep_time > 0:
                     logger.info(f"Rate limit reached, sleeping for {sleep_time:.2f} seconds")
                     await asyncio.sleep(sleep_time)
-            
             self.requests.append(now)
 
 class ScopeValidator:
     """Validates that targets are within allowed testing scope"""
-    
     def __init__(self, allowed_domains: List[str] = None, blocked_paths: List[str] = None):
         self.allowed_domains = allowed_domains or []
         self.blocked_paths = blocked_paths or ['/admin', '/system', '/dev']
-        
-        # Dangerous patterns that should never be in payloads
-        self.dangerous_patterns = [
-            r'rm\s+-rf',          # File deletion commands
-            r'format\s+c:',       # Disk formatting
-            r'del\s+/[qsf]',      # Windows delete commands
-            r'DROP\s+DATABASE',   # Database destruction
-            r'TRUNCATE\s+TABLE',  # Table destruction
-        ]
-    
+        self.dangerous_patterns = [r'rm\s+-rf', r'format\s+c:', r'del\s+/[qsf]', r'DROP\s+DATABASE', r'TRUNCATE\s+TABLE']
+
     async def is_allowed(self, url: str) -> bool:
-        """Check if URL is within allowed scope"""
-        parsed = urllib.parse.urlparse(url)
-        domain = parsed.netloc.lower()
-        path = parsed.path
-        
-        # Check domain whitelist
-        if self.allowed_domains:
-            if not any(domain.endswith(allowed.lower()) for allowed in self.allowed_domains):
+        try:
+            parsed = urllib.parse.urlparse(url)
+            domain = parsed.netloc.lower()
+            path = parsed.path
+            
+            if self.allowed_domains and not any(domain.endswith(allowed.lower()) for allowed in self.allowed_domains):
                 logger.warning(f"Domain {domain} not in allowed list")
                 return False
-        
-        # Check blocked paths
-        for blocked_path in self.blocked_paths:
-            if path.startswith(blocked_path):
+            if any(path.startswith(blocked_path) for blocked_path in self.blocked_paths):
                 logger.warning(f"Path {path} is blocked")
                 return False
-        
-        return True
-    
+            return True
+        except Exception as e:
+            logger.error(f"Error validating URL {url}: {e}")
+            return False
+
     def is_payload_safe(self, payload: str) -> bool:
-        """Check if payload is safe to use"""
-        for pattern in self.dangerous_patterns:
-            if re.search(pattern, payload, re.IGNORECASE):
-                logger.warning(f"Dangerous payload pattern detected: {pattern}")
-                return False
+        if any(re.search(pattern, payload, re.IGNORECASE) for pattern in self.dangerous_patterns):
+            logger.warning(f"Dangerous payload pattern detected in: {payload}")
+            return False
         return True
 
 class SecurityError(Exception):
     """Raised when security constraints are violated"""
     pass
 
-# =============================================================================
-# MCP Server Implementation
-# =============================================================================
-
 class VulnerabilityDatabase:
     """SQLite database for storing vulnerability findings"""
-    
     def __init__(self, db_path: str = "vulnerabilities.db"):
         self.db_path = db_path
         self.init_database()
-    
+
     def init_database(self):
-        """Initialize database schema"""
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS vulnerabilities (
-                    id TEXT PRIMARY KEY,
-                    type TEXT NOT NULL,
-                    severity TEXT NOT NULL,
-                    title TEXT NOT NULL,
-                    description TEXT,
-                    location TEXT,
-                    evidence TEXT,
-                    remediation TEXT,
-                    confidence REAL,
-                    timestamp REAL,
-                    target_url TEXT
+                    id TEXT PRIMARY KEY, type TEXT NOT NULL, severity TEXT NOT NULL,
+                    title TEXT NOT NULL, description TEXT, location TEXT, evidence TEXT,
+                    remediation TEXT, confidence REAL, timestamp REAL, target_url TEXT
                 )
             """)
             conn.commit()
-    
+
     async def save_finding(self, vulnerability: Vulnerability, target_url: str):
-        """Save vulnerability finding to database"""
-        vuln_id = hashlib.sha256(
-            f"{vulnerability.type}_{vulnerability.location}_{target_url}".encode()
-        ).hexdigest()[:16]
-        
+        # The vulnerability object from the AI might not have all keys
+        vuln_data = {
+            "type": vulnerability.get('type', 'unknown'),
+            "severity": vulnerability.get('severity', 'info'),
+            "title": vulnerability.get('title', 'Untitled Finding'),
+            "description": vulnerability.get('description', ''),
+            "location": vulnerability.get('location', {}),
+            "evidence": vulnerability.get('evidence', {}),
+            "remediation": vulnerability.get('remediation', ''),
+            "confidence": vulnerability.get('confidence', 0.0),
+            "timestamp": time.time()
+        }
+        vuln_id = hashlib.sha256(f"{vuln_data['type']}_{json.dumps(vuln_data['location'])}_{target_url}".encode()).hexdigest()[:16]
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("""
-                INSERT OR REPLACE INTO vulnerabilities 
-                (id, type, severity, title, description, location, evidence, 
+                INSERT OR REPLACE INTO vulnerabilities
+                (id, type, severity, title, description, location, evidence,
                  remediation, confidence, timestamp, target_url)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                vuln_id, vulnerability.type, vulnerability.severity,
-                vulnerability.title, vulnerability.description,
-                json.dumps(vulnerability.location), json.dumps(vulnerability.evidence),
-                vulnerability.remediation, vulnerability.confidence,
-                vulnerability.timestamp, target_url
+                vuln_id, vuln_data['type'], vuln_data['severity'],
+                vuln_data['title'], vuln_data['description'],
+                json.dumps(vuln_data['location']), json.dumps(vuln_data['evidence']),
+                vuln_data['remediation'], vuln_data['confidence'],
+                vuln_data['timestamp'], target_url
             ))
             conn.commit()
-        
         logger.info(f"Saved vulnerability finding: {vuln_id}")
         return vuln_id
 
+# =============================================================================
+# PayloadDatabase to use AI
+# =============================================================================
 class PayloadDatabase:
-    """In-memory payload database with context-aware payload generation"""
-    
-    def __init__(self):
-        # Curated payloads for different vulnerability types
-        self.payloads = {
-            VulnType.XSS.value: [
-                "<script>alert('XSS')</script>",
-                "<img src=x onerror=alert('XSS')>",
-                "javascript:alert('XSS')",
-                "';alert('XSS');//",
-                "\"><script>alert('XSS')</script>",
-                "<svg onload=alert('XSS')>",
-                "<%2Fscript%3E%3Cscript%3Ealert(%27XSS%27)%3C%2Fscript%3E",
-            ],
-            VulnType.SQLI.value: [
-                "' OR '1'='1",
-                "'; DROP TABLE users;--",
-                "1' UNION SELECT null,null,null--",
-                "admin'--",
-                "' OR 1=1#",
-                "1' AND (SELECT SUBSTRING(@@version,1,1))='5'--",
-                "' WAITFOR DELAY '00:00:05'--",
-            ],
-            VulnType.SSRF.value: [
-                "http://169.254.169.254/latest/meta-data/",
-                "file:///etc/passwd",
-                "http://localhost:22",
-                "http://127.0.0.1:8080",
-                "gopher://127.0.0.1:3306/",
-                "dict://127.0.0.1:11211/",
-            ],
-            VulnType.LFI.value: [
-                "../../../etc/passwd",
-                "..\\..\\..\\windows\\system32\\drivers\\etc\\hosts",
-                "/etc/passwd%00",
-                "....//....//....//etc/passwd",
-                "%2e%2e%2f%2e%2e%2f%2e%2e%2fetc%2fpasswd",
-            ]
+    """Payload database that uses an LLM for context-aware payload generation"""
+    def __init__(self, ai_interface: AIInterface):
+        self.ai_interface = ai_interface
+        self.fallback_payloads = {
+            VulnType.XSS.value: ["<script>alert('XSS')</script>", "<img src=x onerror=alert('XSS')>"],
+            VulnType.SQLI.value: ["' OR '1'='1", "'; DROP TABLE users;--"],
         }
-    
-    def get_payloads(self, vuln_type: str, context: Dict[str, Any] = None, count: int = 10) -> List[str]:
-        """Get payloads for specific vulnerability type with context awareness"""
-        base_payloads = self.payloads.get(vuln_type, [])
-        
+
+    async def get_payloads(self, vuln_type: str, context: Dict[str, Any] = None, count: int = 10) -> List[str]:
         if not context:
-            return base_payloads[:count]
-        
-        # Context-aware payload modification
-        filtered_payloads = []
-        technology = context.get('technology', '').lower()
-        input_type = context.get('input_type', '').lower()
-        
-        for payload in base_payloads:
-            # Modify payloads based on detected technology
-            if vuln_type == VulnType.SQLI.value:
-                if 'mysql' in technology:
-                    payload = payload.replace('#', '-- ')
-                elif 'oracle' in technology:
-                    payload = payload.replace('--', '/**/').replace('#', '/**/')
-            
-            # Modify based on input type
-            if input_type == 'json' and vuln_type == VulnType.XSS.value:
-                payload = payload.replace('"', '\\"')
-            
-            filtered_payloads.append(payload)
-        
-        return filtered_payloads[:count]
+            return self.fallback_payloads.get(vuln_type, [])[:count]
+        try:
+            # Add timeout for AI payload generation
+            payloads = await asyncio.wait_for(
+                self.ai_interface.generate_payloads(vuln_type, context, count),
+                timeout=30.0  # 30 second timeout
+            )
+            if payloads:
+                return payloads
+        except asyncio.TimeoutError:
+            logger.warning("AI payload generation timed out. Using fallback payloads.")
+        except Exception as e:
+            logger.warning(f"AI payload generation failed: {e}. Using fallback payloads.")
+        return self.fallback_payloads.get(vuln_type, [])[:count]
+
 
 class WebCrawler:
-    """Web crawler for discovering attack surface"""
-    
-    def __init__(self, session: aiohttp.ClientSession):
+    """Web crawler using BeautifulSoup for robust parsing with limits."""
+    def __init__(self, session: aiohttp.ClientSession, max_pages: int = 50, max_depth: int = 3):
         self.session = session
         self.visited_urls = set()
         self.discovered_endpoints = []
         self.discovered_forms = []
-    
-    async def crawl_site(self, seed_url: str, depth: int = 2, scope_domains: List[str] = None) -> Dict[str, Any]:
-        """Crawl website to discover endpoints and attack surface"""
-        logger.info(f"Starting crawl of {seed_url} with depth {depth}")
+        self.page_bodies = {}
+        self.max_pages = max_pages  # Limit total pages crawled
+        self.max_depth = max_depth  # Limit crawl depth
+        self.pages_crawled = 0
+
+    async def crawl_site(self, seed_url: str, depth: int = 2, scope_domains: List[str] = None):
+        # Enforce maximum depth limit
+        depth = min(depth, self.max_depth)
+        logger.info(f"Starting crawl of {seed_url} with depth {depth} (max pages: {self.max_pages})")
         
-        self.visited_urls.clear()
-        self.discovered_endpoints.clear()
-        self.discovered_forms.clear()
+        base_domain = urllib.parse.urlparse(seed_url).netloc
+        await self._crawl_recursive(seed_url, depth, scope_domains or [base_domain])
         
-        await self._crawl_recursive(seed_url, depth, scope_domains or [])
-        
+        logger.info(f"Crawl completed. Visited {len(self.visited_urls)} pages, found {len(self.discovered_endpoints)} endpoints, {len(self.discovered_forms)} forms")
         return {
             "endpoints": self.discovered_endpoints,
             "forms": self.discovered_forms,
-            "static_analysis": {
-                "js_endpoints": [],  # Would extract from JavaScript files
-                "comments": [],      # Would extract HTML comments
-                "technologies": self._detect_technologies()
-            }
         }
-    
-    async def _crawl_recursive(self, url: str, depth: int, scope_domains: List[str]):
-        """Recursive crawling with depth limiting"""
-        if depth <= 0 or url in self.visited_urls:
-            return
-        
-        parsed_url = urllib.parse.urlparse(url)
-        if scope_domains and not any(parsed_url.netloc.endswith(domain) for domain in scope_domains):
-            return
-        
-        self.visited_urls.add(url)
-        
+
+    def _extract_forms(self, soup: BeautifulSoup, base_url: str):
+        forms = soup.find_all('form')
+        logger.debug(f"Found {len(forms)} forms on {base_url}")
+        for form in forms:
+            try:
+                action = form.get('action', '')
+                method = form.get('method', 'GET').upper()
+                action_url = urllib.parse.urljoin(base_url, action)
+                inputs = []
+                for input_tag in form.find_all(['input', 'textarea', 'select']):
+                    name = input_tag.get('name')
+                    if name:
+                        inputs.append({"name": name, "type": input_tag.get('type', 'text')})
+                form_data = {"action": action_url, "method": method, "inputs": inputs}
+                if form_data not in self.discovered_forms:
+                    self.discovered_forms.append(form_data)
+            except Exception as e:
+                logger.warning(f"Error extracting form from {base_url}: {e}")
+
+    def _extract_links(self, soup: BeautifulSoup, base_url: str):
+        urls = set()
         try:
-            async with self.session.get(url, timeout=10) as response:
-                if response.status == 200:
-                    content = await response.text()
-                    
-                    # Extract endpoint information
-                    endpoint_info = {
-                        "url": url,
-                        "method": "GET",
-                        "parameters": self._extract_parameters(url),
-                        "headers_observed": dict(response.headers),
-                        "forms": [],
-                        "technology_stack": []
-                    }
-                    self.discovered_endpoints.append(endpoint_info)
-                    
-                    # Extract forms
-                    forms = self._extract_forms(content, url)
-                    self.discovered_forms.extend(forms)
-                    
-                    # Extract links for further crawling
-                    if depth > 1:
-                        links = self._extract_links(content, url)
-                        for link in links[:10]:  # Limit to prevent infinite crawling
-                            await self._crawl_recursive(link, depth - 1, scope_domains)
+            # Limit link extraction to avoid excessive processing
+            max_links = 100  # Limit number of links per page
+            link_count = 0
+            
+            # <a href>
+            for tag in soup.find_all('a', href=True):
+                if link_count >= max_links:
+                    break
+                urls.add(urllib.parse.urljoin(base_url, tag['href']))
+                link_count += 1
+            
+            # <form action> (already limited by form extraction)
+            for tag in soup.find_all('form', action=True):
+                urls.add(urllib.parse.urljoin(base_url, tag['action']))
+                
+        except Exception as e:
+            logger.warning(f"Error extracting links from {base_url}: {e}")
         
+        return urls
+
+    async def _crawl_recursive(self, url: str, depth: int, scope_domains: List[str]):
+        # Check limits first
+        if (depth <= 0 or 
+            url in self.visited_urls or 
+            self.pages_crawled >= self.max_pages):
+            return
+            
+        try:
+            parsed_url = urllib.parse.urlparse(url)
+            if not any(domain in parsed_url.netloc for domain in scope_domains):
+                return
+                
+            self.visited_urls.add(url)
+            self.pages_crawled += 1
+            
+            logger.debug(f"Crawling {url} (depth: {depth}, pages crawled: {self.pages_crawled})")
+            
+            async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                if response.status == 200 and 'text/html' in response.headers.get('Content-Type', ''):
+                    content = await response.text()
+                    # Limit content size to prevent memory issues
+                    if len(content) > 1024 * 1024:  # 1MB limit
+                        content = content[:1024 * 1024]
+                        
+                    self.page_bodies[url] = content
+                    soup = BeautifulSoup(content, 'html.parser')
+                    
+                    # Discover endpoints from URL parameters
+                    query_params = list(urllib.parse.parse_qs(parsed_url.query).keys())
+                    if query_params:  # Only add if there are parameters
+                        endpoint_info = {
+                            "url": url, 
+                            "method": "GET",
+                            "parameters": query_params
+                        }
+                        if endpoint_info not in self.discovered_endpoints:
+                            self.discovered_endpoints.append(endpoint_info)
+                    
+                    # Discover forms on the page
+                    self._extract_forms(soup, url)
+                    
+                    # Continue crawling if we haven't hit limits
+                    if depth > 1 and self.pages_crawled < self.max_pages:
+                        links = self._extract_links(soup, url)
+                        # Limit concurrent crawling to prevent overwhelming
+                        semaphore = asyncio.Semaphore(5)  # Max 5 concurrent requests
+                        
+                        async def crawl_with_semaphore(link):
+                            async with semaphore:
+                                await self._crawl_recursive(link, depth - 1, scope_domains)
+                        
+                        # Process links in batches to avoid creating too many tasks
+                        links_list = list(links)[:20]  # Limit to 20 links per page
+                        await asyncio.gather(*[crawl_with_semaphore(link) for link in links_list], return_exceptions=True)
+                        
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout crawling {url}")
         except Exception as e:
             logger.warning(f"Error crawling {url}: {e}")
-    
-    def _extract_parameters(self, url: str) -> List[str]:
-        """Extract query parameters from URL"""
-        parsed = urllib.parse.urlparse(url)
-        return list(urllib.parse.parse_qs(parsed.query).keys())
-    
-    def _extract_forms(self, html: str, base_url: str) -> List[Dict[str, Any]]:
-        """Extract forms from HTML content"""
-        # Simplified form extraction - in practice, use BeautifulSoup
-        forms = []
-        
-        # Basic regex-based form extraction (use proper HTML parser in production)
-        form_pattern = r'<form[^>]*action=["\']?([^"\'>\s]+)[^>]*>(.*?)</form>'
-        input_pattern = r'<input[^>]*name=["\']([^"\']+)["\'][^>]*type=["\']([^"\']+)["\'][^>]*>'
-        
-        for match in re.finditer(form_pattern, html, re.DOTALL | re.IGNORECASE):
-            action = match.group(1)
-            form_content = match.group(2)
-            
-            # Resolve relative URLs
-            if not action.startswith('http'):
-                action = urllib.parse.urljoin(base_url, action)
-            
-            inputs = []
-            for input_match in re.finditer(input_pattern, form_content, re.IGNORECASE):
-                inputs.append({
-                    "name": input_match.group(1),
-                    "type": input_match.group(2)
-                })
-            
-            forms.append({
-                "action": action,
-                "method": "POST",  # Default assumption
-                "inputs": inputs
-            })
-        
-        return forms
-    
-    def _extract_links(self, html: str, base_url: str) -> List[str]:
-        """Extract links from HTML content"""
-        links = []
-        link_pattern = r'<a[^>]*href=["\']([^"\']+)["\'][^>]*>'
-        
-        for match in re.finditer(link_pattern, html, re.IGNORECASE):
-            href = match.group(1)
-            if href.startswith('http'):
-                links.append(href)
-            elif not href.startswith('#') and not href.startswith('javascript:'):
-                links.append(urllib.parse.urljoin(base_url, href))
-        
-        return links
-    
-    def _detect_technologies(self) -> List[str]:
-        """Detect technologies from headers and content"""
-        # In practice, integrate with Wappalyzer or similar
-        return ["nginx", "php"]  # Placeholder
 
+# =============================================================================
+# MCPServer with enhanced limits
+# =============================================================================
 class MCPServer:
     """Main MCP Server handling all vulnerability scanning operations"""
-    
-    def __init__(self):
+    def __init__(self, ai_interface: AIInterface):
         self.rate_limiter = RateLimiter(requests_per_minute=30)
         self.scope_validator = ScopeValidator()
-        self.payload_db = PayloadDatabase()
+        self.payload_db = PayloadDatabase(ai_interface)
         self.vuln_db = VulnerabilityDatabase()
-        
-        # HTTP session for making requests
         self.session = None
-        
-        # Available MCP tools
         self.tools = {
-            "crawl_site": self.crawl_site,
-            "send_request": self.send_request,
-            "inject_payload": self.inject_payload,
-            "analyze_response": self.analyze_response,
-            "save_finding": self.save_finding,
-            "get_payloads": self.get_payloads,
+            "crawl_site": self.crawl_site, "send_request": self.send_request,
+            "inject_payload": self.inject_payload, "analyze_response": self.analyze_response,
+            "save_finding": self.save_finding, "get_payloads": self.get_payloads,
             "validate_target": self.validate_target,
         }
-    
+
     async def __aenter__(self):
-        """Async context manager entry"""
-        self.session = aiohttp.ClientSession()
+        # Configure session with timeouts
+        timeout = aiohttp.ClientTimeout(total=30, connect=10)
+        self.session = aiohttp.ClientSession(timeout=timeout)
         return self
-    
+
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Async context manager exit"""
-        if self.session:
+        if self.session: 
             await self.session.close()
-    
+
     async def call_tool(self, tool_name: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Main entry point for calling MCP tools"""
-        if tool_name not in self.tools:
+        if tool_name not in self.tools: 
             raise ValueError(f"Unknown tool: {tool_name}")
-        
-        # Apply safety checks for dangerous operations
         await self._validate_request(tool_name, params)
-        
-        # Call the appropriate tool
         tool_func = self.tools[tool_name]
-        result = await tool_func(**params)
-        
-        logger.info(f"Tool {tool_name} executed successfully")
-        return result
-    
+        try:
+            # Add timeout for tool execution
+            result = await asyncio.wait_for(tool_func(**params), timeout=60.0)
+            logger.info(f"Tool {tool_name} executed successfully")
+            return result
+        except asyncio.TimeoutError:
+            logger.error(f"Tool {tool_name} timed out")
+            return {"error": "Tool execution timed out"}
+
     async def _validate_request(self, tool_name: str, params: Dict[str, Any]):
-        """Validate request for safety and scope compliance"""
         if tool_name in ['inject_payload', 'send_request']:
-            # Validate URL scope
             url = params.get('url')
             if url and not await self.scope_validator.is_allowed(url):
                 raise SecurityError("Target outside allowed scope")
-            
-            # Check dangerous payloads
             payload = params.get('payload')
             if payload and not self.scope_validator.is_payload_safe(payload):
                 raise SecurityError("Dangerous payload detected")
-            
-            # Apply rate limiting
             await self.rate_limiter.acquire()
-    
-    async def crawl_site(self, seed_url: str, depth: int = 2, scope_domains: List[str] = None, 
-                        follow_forms: bool = True, extract_js_urls: bool = True) -> Dict[str, Any]:
-        """Crawl website to discover attack surface"""
-        crawler = WebCrawler(self.session)
+
+    async def crawl_site(self, seed_url: str, depth: int = 2, scope_domains: List[str] = None):
+        # Limit crawl parameters
+        depth = min(depth, 3)  # Max depth of 3
+        crawler = WebCrawler(self.session, max_pages=50, max_depth=depth)
         return await crawler.crawl_site(seed_url, depth, scope_domains)
     
-    async def send_request(self, method: str, url: str, headers: Dict[str, str] = None, 
-                          body: str = "", follow_redirects: bool = True, timeout: int = 10) -> Dict[str, Any]:
-        """Send HTTP request and capture response"""
+    async def send_request(self, method: str, url: str, headers: Dict[str, str] = None, body: Any = None, **kwargs):
         start_time = time.time()
-        redirect_chain = []
-        
         try:
-            async with self.session.request(
-                method=method,
-                url=url,
-                headers=headers or {},
-                data=body,
-                allow_redirects=follow_redirects,
-                timeout=timeout
-            ) as response:
+            # For form submissions, body might be a dict
+            if isinstance(body, dict):
+                headers = headers or {}
+                headers.setdefault('Content-Type', 'application/x-www-form-urlencoded')
+                body = urllib.parse.urlencode(body)
+
+            # Add timeout to individual requests
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with self.session.request(method=method, url=url, headers=headers or {}, 
+                                          data=body, timeout=timeout, **kwargs) as response:
                 response_body = await response.text()
-                response_time = time.time() - start_time
-                
-                # Track redirects
-                if hasattr(response, 'history'):
-                    redirect_chain = [str(r.url) for r in response.history]
-                
                 return {
-                    "status_code": response.status,
-                    "headers": dict(response.headers),
+                    "status_code": response.status, 
+                    "headers": dict(response.headers), 
                     "body": response_body,
-                    "response_time": response_time,
-                    "redirect_chain": redirect_chain,
-                    "size_bytes": len(response_body.encode('utf-8')),
-                    "tls_info": {"version": "TLSv1.3", "cipher": "AES256-GCM"}  # Placeholder
+                    "response_time": time.time() - start_time,
                 }
-        
-        except asyncio.TimeoutError:
-            return {"error": "Request timeout", "response_time": time.time() - start_time}
         except Exception as e:
+            logger.warning(f"Request failed for {url}: {e}")
             return {"error": str(e), "response_time": time.time() - start_time}
     
-    async def inject_payload(self, url: str, injection_point: Dict[str, Any], payload: str, 
-                           method: str = "GET", encode: bool = False) -> Dict[str, Any]:
-        """Inject payload into specific parameter or location"""
-        if encode:
-            payload = urllib.parse.quote(payload)
-        
-        # Prepare request based on injection point type
-        headers = {}
-        body = ""
-        modified_url = url
-        
-        injection_type = injection_point.get('type')
-        param_name = injection_point.get('name')
-        
-        if injection_type == 'query_param':
-            # Inject into URL query parameter
-            parsed = urllib.parse.urlparse(url)
-            params = urllib.parse.parse_qs(parsed.query)
-            params[param_name] = [payload]
-            new_query = urllib.parse.urlencode(params, doseq=True)
-            modified_url = urllib.parse.urlunparse(
-                (parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment)
-            )
-        
-        elif injection_type == 'header':
-            headers[param_name] = payload
-        
-        elif injection_type == 'form_field':
-            # Inject into form data
-            body = urllib.parse.urlencode({param_name: payload})
-            headers['Content-Type'] = 'application/x-www-form-urlencoded'
-            method = 'POST'
-        
-        # Send the crafted request
-        return await self.send_request(method, modified_url, headers, body)
-    
-    async def analyze_response(self, request: Dict[str, Any], response: Dict[str, Any], 
-                             vulnerability_types: List[str] = None, context: Dict[str, Any] = None) -> Dict[str, Any]:
-        """Analyze HTTP response for vulnerability indicators"""
-        indicators = {}
-        payload = request.get('payload', '')
-        response_body = response.get('body', '')
-        response_headers = response.get('headers', {})
-        status_code = response.get('status_code', 0)
-        response_time = response.get('response_time', 0)
-        
-        # Check for payload reflection
-        indicators['payload_reflection'] = {
-            "found": payload in response_body or payload in str(response_headers),
-            "locations": [],
-            "context": "",
-            "encoded": False
-        }
-        
-        if indicators['payload_reflection']['found']:
-            if payload in response_body:
-                indicators['payload_reflection']['locations'].append('body')
-            if payload in str(response_headers):
-                indicators['payload_reflection']['locations'].append('headers')
-        
-        # Check for error disclosure
-        error_patterns = {
-            'sql_error': [
-                r'SQL syntax.*MySQL',
-                r'Warning.*mysql_.*',
-                r'valid MySQL result',
-                r'PostgreSQL.*ERROR',
-                r'Warning.*pg_.*',
-                r'valid PostgreSQL result'
-            ],
-            'php_error': [
-                r'<b>Fatal error</b>:.*in <b>',
-                r'<b>Warning</b>:.*in <b>',
-                r'<b>Parse error</b>:.*in <b>'
-            ],
-            'asp_error': [
-                r'Microsoft VBScript runtime error',
-                r'Microsoft JET Database Engine error'
-            ]
-        }
-        
-        indicators['error_disclosure'] = {"found": False, "type": "", "message": ""}
-        
-        for error_type, patterns in error_patterns.items():
-            for pattern in patterns:
-                if re.search(pattern, response_body, re.IGNORECASE):
-                    indicators['error_disclosure'] = {
-                        "found": True,
-                        "type": error_type,
-                        "message": re.search(pattern, response_body, re.IGNORECASE).group(0)[:100],
-                        "stack_trace": False
-                    }
-                    break
-        
-        # Check for timing anomalies (basic implementation)
-        baseline_time = context.get('baseline_response_time', 0.5) if context else 0.5
-        indicators['timing_anomaly'] = {
-            "baseline_ms": baseline_time * 1000,
-            "current_ms": response_time * 1000,
-            "significant": response_time > baseline_time * 3
-        }
-        
-        # Status code changes
-        baseline_status = context.get('baseline_status_code', 200) if context else 200
-        indicators['status_changes'] = {
-            "baseline": baseline_status,
-            "current": status_code
-        }
-        
-        return {"indicators": indicators}
-    
-    async def get_payloads(self, vulnerability_type: str, context: Dict[str, Any] = None, count: int = 10) -> Dict[str, Any]:
-        """Get payloads for specific vulnerability types"""
-        payloads = self.payload_db.get_payloads(vulnerability_type, context, count)
-        return {"payloads": payloads, "total": len(payloads)}
-    
-    async def save_finding(self, vulnerability: Dict[str, Any]) -> Dict[str, Any]:
-        """Save vulnerability finding to database"""
-        vuln = Vulnerability(**vulnerability)
-        target_url = vulnerability.get('location', {}).get('url', 'unknown')
-        vuln_id = await self.vuln_db.save_finding(vuln, target_url)
-        return {"id": vuln_id, "status": "saved"}
-    
-    async def validate_target(self, url: str, scope_rules: Dict[str, Any] = None) -> Dict[str, Any]:
-        """Validate if target is in scope and safe to test"""
-        if scope_rules:
-            # Update scope validator with custom rules
-            allowed_domains = scope_rules.get('allowed_domains', [])
-            if allowed_domains:
-                self.scope_validator.allowed_domains = allowed_domains
-        
-        is_valid = await self.scope_validator.is_allowed(url)
-        return {"valid": is_valid, "url": url}
+    async def inject_payload(self, url: str, injection_point: Dict[str, Any], payload: str, method: str = "GET", **kwargs):
+        try:
+            modified_url = url
+            headers = kwargs.get('headers', {})
+            body = kwargs.get('data', None)
+
+            if injection_point['type'] == 'query_param':
+                parsed = urllib.parse.urlparse(url)
+                params = urllib.parse.parse_qs(parsed.query)
+                params[injection_point['name']] = [payload]
+                new_query = urllib.parse.urlencode(params, doseq=True)
+                modified_url = parsed._replace(query=new_query).geturl()
+                return await self.send_request(method, modified_url, headers, body)
+            
+            elif injection_point['type'] == 'form_field':
+                body = {injection_point['name']: payload}
+                return await self.send_request(method, modified_url, headers, body)
+
+            return await self.send_request(method, modified_url, headers, body)
+        except Exception as e:
+            logger.error(f"Payload injection failed: {e}")
+            return {"error": str(e)}
+
+    async def analyze_response(self, request: Dict[str, Any], response: Dict[str, Any], **kwargs) -> Dict[str, Any]:
+        try:
+            indicators = {}
+            payload = request.get('payload', '')
+            response_body = response.get('body', '')
+            
+            # Basic analysis
+            indicators['payload_reflection'] = {"found": payload in response_body}
+            sql_error_patterns = [r'SQL syntax.*MySQL', r'Warning.*mysql_', r'ORA-\d+', r'Microsoft.*ODBC.*SQL']
+            indicators['error_disclosure'] = {"found": any(re.search(p, response_body, re.I) for p in sql_error_patterns)}
+            
+            return {"indicators": indicators}
+        except Exception as e:
+            logger.error(f"Response analysis failed: {e}")
+            return {"indicators": {}}
+
+    async def get_payloads(self, vulnerability_type: str, context: Dict[str, Any] = None, count: int = 10):
+        # Limit payload count
+        count = min(count, 5)  # Max 5 payloads per request
+        payloads = await self.payload_db.get_payloads(vulnerability_type, context, count)
+        return {"payloads": payloads}
+
+    async def save_finding(self, vulnerability: Dict[str, Any]):
+        try:
+            target_url = vulnerability.get('location', {}).get('url', 'unknown')
+            vuln_id = await self.vuln_db.save_finding(vulnerability, target_url)
+            return {"id": vuln_id, "status": "saved"}
+        except Exception as e:
+            logger.error(f"Failed to save finding: {e}")
+            return {"error": str(e)}
+
+    async def validate_target(self, url: str, scope_rules: Dict[str, Any] = None):
+        try:
+            if scope_rules and 'allowed_domains' in scope_rules:
+                self.scope_validator.allowed_domains = scope_rules['allowed_domains']
+            is_valid = await self.scope_validator.is_allowed(url)
+            return {"valid": is_valid, "url": url}
+        except Exception as e:
+            logger.error(f"Target validation failed: {e}")
+            return {"valid": False, "url": url}
 
 # =============================================================================
-# LLM Agent Implementation
+# Enhanced VulnScanAgent with limits and timeouts
 # =============================================================================
-
 class VulnScanAgent:
-    """AI agent that orchestrates vulnerability scanning using MCP tools"""
-    
-    def __init__(self, mcp_server: MCPServer):
+    """AI agent that orchestrates vulnerability scanning using MCP tools and AI reasoning"""
+    def __init__(self, mcp_server: MCPServer, ai_interface: AIInterface, max_targets_per_vuln: int = 10):
         self.mcp_server = mcp_server
+        self.ai_interface = ai_interface
         self.context = {}
         self.attack_plan = {}
-        self.findings = []
-    
-    async def reconnaissance_phase(self, target_url: str) -> Dict[str, Any]:
-        """Phase 1: Discover attack surface and plan testing strategy"""
+        self.max_targets_per_vuln = max_targets_per_vuln  # Limit targets per vulnerability type
+        self.scan_start_time = None
+        self.max_scan_duration = 300  # 5 minutes maximum scan time
+
+    async def reconnaissance_phase(self, target_url: str):
         logger.info(f"Starting reconnaissance phase for {target_url}")
+        self.scan_start_time = time.time()
         
-        # Validate target is in scope
         validation = await self.mcp_server.call_tool("validate_target", {"url": target_url})
-        if not validation.get("valid"):
+        if not validation.get("valid"): 
             raise SecurityError("Target validation failed")
+            
+        domain = urllib.parse.urlparse(target_url).netloc
+        crawl_result = await self.mcp_server.call_tool(
+            "crawl_site",
+            {"seed_url": target_url, "scope_domains": [domain], "depth": 2}  # Limit depth
+        )
         
-        # Crawl target to discover attack surface
-        crawl_result = await self.mcp_server.call_tool("crawl_site", {
-            "seed_url": target_url,
-            "depth": 2
-        })
+        logger.info(f"Crawl completed: {len(crawl_result.get('endpoints', []))} endpoints, {len(crawl_result.get('forms', []))} forms")
         
-        # Analyze discovered information to build context
         self.context = self._analyze_stack(crawl_result)
-        
-        # Generate attack plan based on discovered attack surface
         self.attack_plan = self._generate_attack_plan(crawl_result)
         
-        logger.info(f"Discovered {len(crawl_result['endpoints'])} endpoints and {len(crawl_result['forms'])} forms")
+        # Limit total targets
+        total_targets = len(self.attack_plan.get('targets', []))
+        if total_targets > 50:  # Limit total targets
+            self.attack_plan['targets'] = self.attack_plan['targets'][:50]
+            logger.warning(f"Limited targets from {total_targets} to 50 for performance")
         
+        logger.info(f"Discovered {len(self.attack_plan.get('targets', []))} potential injection points.")
         return self.attack_plan
-    
-    def _analyze_stack(self, crawl_result: Dict[str, Any]) -> Dict[str, Any]:
-        """Analyze crawled data to understand technology stack and context"""
-        context = {
-            "technologies": crawl_result.get("static_analysis", {}).get("technologies", []),
+
+    def _analyze_stack(self, crawl_result: Dict[str, Any]):
+        return {
+            "technologies": ["generic"], 
             "endpoints": crawl_result.get("endpoints", []),
-            "forms": crawl_result.get("forms", []),
-            "parameters": set()
+            "forms": crawl_result.get("forms", [])
         }
+
+    def _generate_attack_plan(self, crawl_result: Dict[str, Any]):
+        plan = {"targets": [], "vulnerability_types": [v.value for v in VulnType]}
         
-        # Extract all parameters for testing
-        for endpoint in crawl_result.get("endpoints", []):
-            context["parameters"].update(endpoint.get("parameters", []))
-        
-        # Determine likely technologies based on headers and content
-        for endpoint in crawl_result.get("endpoints", []):
-            headers = endpoint.get("headers_observed", {})
-            if "x-powered-by" in headers:
-                context["technologies"].append(headers["x-powered-by"])
-        
-        context["parameters"] = list(context["parameters"])
-        return context
-    
-    def _generate_attack_plan(self, crawl_result: Dict[str, Any]) -> Dict[str, Any]:
-        """Generate comprehensive attack plan based on discovered attack surface"""
-        plan = {
-            "targets": [],
-            "vulnerability_types": [],
-            "priority_order": []
-        }
-        
-        # Generate targets from endpoints
+        # Targets from URL parameters
         for endpoint in crawl_result.get("endpoints", []):
             for param in endpoint.get("parameters", []):
                 plan["targets"].append({
                     "url": endpoint["url"],
-                    "injection_point": {
-                        "type": "query_param",
-                        "name": param
-                    },
+                    "injection_point": {"type": "query_param", "name": param},
                     "method": endpoint.get("method", "GET")
                 })
         
-        # Generate targets from forms
+        # Targets from form inputs
         for form in crawl_result.get("forms", []):
             for input_field in form.get("inputs", []):
                 plan["targets"].append({
                     "url": form["action"],
-                    "injection_point": {
-                        "type": "form_field",
-                        "name": input_field["name"]
-                    },
+                    "injection_point": {"type": "form_field", "name": input_field["name"]},
                     "method": form.get("method", "POST")
-                })
-        
-        # Determine which vulnerability types to test based on context
-        detected_techs = [tech.lower() for tech in self.context.get("technologies", [])]
-        
-        # Always test for these common vulnerabilities
-        plan["vulnerability_types"] = [VulnType.XSS.value]
-        
-        # Add SQL injection if database technologies detected
-        if any(tech in detected_techs for tech in ['mysql', 'postgresql', 'php', 'asp']):
-            plan["vulnerability_types"].append(VulnType.SQLI.value)
-        
-        # Add SSRF for all targets (common attack vector)
-        plan["vulnerability_types"].append(VulnType.SSRF.value)
-        
-        # Add LFI for PHP applications
-        if any(tech in detected_techs for tech in ['php', 'apache']):
-            plan["vulnerability_types"].append(VulnType.LFI.value)
-        
-        # Prioritize testing order
-        plan["priority_order"] = self._prioritize_tests(plan["targets"])
+                })    
         
         return plan
     
-    def _prioritize_tests(self, targets: List[Dict[str, Any]]) -> List[int]:
-        """Prioritize testing order based on likelihood of success"""
-        # Simple prioritization - in practice, use ML models or heuristics
-        priority_scores = []
-        
-        for i, target in enumerate(targets):
-            score = 0
-            
-            # Higher priority for form inputs (more likely to be vulnerable)
-            if target["injection_point"]["type"] == "form_field":
-                score += 3
-            
-            # Higher priority for parameters with suspicious names
-            param_name = target["injection_point"]["name"].lower()
-            if any(keyword in param_name for keyword in ['id', 'user', 'file', 'url', 'path']):
-                score += 2
-            
-            # Higher priority for POST requests
-            if target.get("method", "GET").upper() == "POST":
-                score += 1
-            
-            priority_scores.append((score, i))
-        
-        # Return indices sorted by priority score (highest first)
-        return [idx for _, idx in sorted(priority_scores, reverse=True)]
+    def _check_scan_timeout(self):
+        """Check if scan has exceeded maximum duration"""
+        if self.scan_start_time and time.time() - self.scan_start_time > self.max_scan_duration:
+            raise TimeoutError("Scan exceeded maximum duration")
     
-    async def test_vulnerability_type(self, vuln_type: str, targets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Test specific vulnerability type against discovered targets"""
+    async def test_vulnerability_type(self, vuln_type: str, targets: List[Dict[str, Any]]):
         logger.info(f"Testing {vuln_type} against {len(targets)} targets")
         
-        # Get contextual payloads for this vulnerability type
-        payload_result = await self.mcp_server.call_tool("get_payloads", {
-            "vulnerability_type": vuln_type,
-            "context": self.context,
-            "count": 15
-        })
+        # Limit targets per vulnerability type
+        limited_targets = targets[:self.max_targets_per_vuln]
+        if len(limited_targets) < len(targets):
+            logger.warning(f"Limited {vuln_type} testing from {len(targets)} to {len(limited_targets)} targets")
         
-        payloads = payload_result["payloads"]
         findings = []
         
-        # Test each target with each payload
-        for target in targets:
-            # First, get baseline response for comparison
-            baseline_response = await self._get_baseline_response(target)
-            
-            for payload in payloads:
-                try:
-                    # Inject payload and capture response
-                    response = await self.mcp_server.call_tool("inject_payload", {
-                        "url": target["url"],
-                        "injection_point": target["injection_point"],
-                        "payload": payload,
-                        "method": target.get("method", "GET")
-                    })
-                    
-                    # Analyze response for vulnerability indicators
-                    analysis = await self.mcp_server.call_tool("analyze_response", {
-                        "request": {"payload": payload, "target": target},
-                        "response": response,
-                        "vulnerability_types": [vuln_type],
-                        "context": {
-                            "baseline_response_time": baseline_response.get("response_time", 0.5),
-                            "baseline_status_code": baseline_response.get("status_code", 200)
-                        }
-                    })
-                    
-                    # Use AI reasoning to determine if this indicates a vulnerability
-                    if self._is_vulnerable(analysis, vuln_type, payload, response):
-                        finding = self._classify_vulnerability(target, payload, analysis, vuln_type)
-                        findings.append(finding)
-                        logger.info(f"Potential {vuln_type} vulnerability found in {target['url']}")
+        for i, target in enumerate(limited_targets):
+            try:
+                # Check timeout before each target
+                self._check_scan_timeout()
                 
-                except Exception as e:
-                    logger.warning(f"Error testing payload {payload} on {target['url']}: {e}")
-                    continue
-        
+                logger.debug(f"Testing {vuln_type} on target {i+1}/{len(limited_targets)}: {target['url']}")
+                
+                target_context = self.context.copy()
+                target_context.update({
+                    "url": target["url"],
+                    "parameter": target["injection_point"]["name"],
+                    "injection_point_type": target["injection_point"]["type"]
+                })
+                
+                payload_result = await self.mcp_server.call_tool("get_payloads", {
+                    "vulnerability_type": vuln_type, 
+                    "context": target_context, 
+                    "count": 3  # Limit payloads per target
+                })
+
+                for payload in payload_result.get("payloads", []):
+                    try:
+                        # Check timeout before each payload
+                        self._check_scan_timeout()
+                        
+                        response = await self.mcp_server.call_tool("inject_payload", {
+                            **target, "payload": payload
+                        })
+                        
+                        if "error" in response:
+                            logger.warning(f"Payload injection failed: {response['error']}")
+                            continue
+                            
+                        analysis = await self.mcp_server.call_tool("analyze_response", {
+                            "request": {"payload": payload}, 
+                            "response": response
+                        })
+
+                        # Add timeout for AI analysis
+                        is_vuln = await asyncio.wait_for(
+                            self.ai_interface.analyze_vulnerability(
+                                {"payload": payload, "target": target}, 
+                                response, 
+                                vuln_type
+                            ),
+                            timeout=30.0
+                        )
+                        
+                        if is_vuln:
+                            finding = await asyncio.wait_for(
+                                self.ai_interface.classify_vulnerability(
+                                    target, payload, analysis, vuln_type
+                                ),
+                                timeout=30.0
+                            )
+                            if finding:
+                                findings.append(finding)
+                                logger.info(f"Potential {vuln_type} vulnerability found in {target['url']}")
+                                
+                    except asyncio.TimeoutError:
+                        logger.warning(f"AI analysis timed out for payload {payload}")
+                        continue
+                    except Exception as e:
+                        logger.warning(f"Error testing payload {payload} on {target['url']}: {e}")
+                        continue
+
+            except TimeoutError:
+                logger.warning("Scan timeout reached, stopping vulnerability testing")
+                break
+            except Exception as e:
+                logger.warning(f"Error testing target {target['url']}: {e}")
+                continue
+
+        logger.info(f"Found {len(findings)} potential {vuln_type} vulnerabilities")
         return findings
-    
-    async def _get_baseline_response(self, target: Dict[str, Any]) -> Dict[str, Any]:
-        """Get baseline response for comparison purposes"""
-        try:
-            return await self.mcp_server.call_tool("send_request", {
-                "method": target.get("method", "GET"),
-                "url": target["url"]
-            })
-        except Exception:
-            return {"response_time": 0.5, "status_code": 200}
-    
-    def _is_vulnerable(self, analysis: Dict[str, Any], vuln_type: str, payload: str, response: Dict[str, Any]) -> bool:
-        """AI reasoning to determine if response indicates vulnerability"""
-        indicators = analysis.get("indicators", {})
-        
-        # XSS Detection Logic
-        if vuln_type == VulnType.XSS.value:
-            reflection = indicators.get("payload_reflection", {})
-            if reflection.get("found") and not reflection.get("encoded"):
-                # Payload reflected without encoding - likely XSS
-                return True
-            
-            # Check for successful script execution indicators
-            if "<script>" in payload and reflection.get("found"):
-                return True
-        
-        # SQL Injection Detection Logic
-        elif vuln_type == VulnType.SQLI.value:
-            error_disclosure = indicators.get("error_disclosure", {})
-            if error_disclosure.get("found") and error_disclosure.get("type") == "sql_error":
-                return True
-            
-            # Check for timing-based SQL injection
-            timing = indicators.get("timing_anomaly", {})
-            if "WAITFOR" in payload or "SLEEP" in payload:
-                if timing.get("significant"):
-                    return True
-            
-            # Check for boolean-based SQL injection
-            status_changes = indicators.get("status_changes", {})
-            if "'1'='1" in payload and status_changes.get("baseline") != status_changes.get("current"):
-                return True
-        
-        # SSRF Detection Logic
-        elif vuln_type == VulnType.SSRF.value:
-            # Check if response indicates successful connection to internal services
-            response_body = response.get("body", "")
-            if any(indicator in response_body.lower() for indicator in [
-                "connection refused", "timeout", "internal server", "metadata"
-            ]):
-                return True
-        
-        # LFI Detection Logic
-        elif vuln_type == VulnType.LFI.value:
-            response_body = response.get("body", "")
-            # Check for file inclusion indicators
-            if any(indicator in response_body for indicator in [
-                "root:x:", "daemon:x:", "[boot loader]", "windows\\system32"
-            ]):
-                return True
-        
-        return False
-    
-    def _classify_vulnerability(self, target: Dict[str, Any], payload: str, analysis: Dict[str, Any], vuln_type: str) -> Dict[str, Any]:
-        """Classify and score vulnerability finding using AI reasoning"""
-        indicators = analysis.get("indicators", {})
-        
-        # Calculate confidence score based on evidence strength
-        confidence = self._calculate_confidence(indicators, vuln_type, payload)
-        
-        # Assess severity based on vulnerability type and context
-        severity = self._assess_severity(target, vuln_type, indicators)
-        
-        # Generate human-readable title and description
-        title = self._generate_title(target, vuln_type, payload)
-        description = self._generate_description(vuln_type, payload, indicators)
-        remediation = self._generate_remediation(vuln_type, target)
-        
-        vulnerability = {
-            "type": vuln_type,
-            "severity": severity.value,
-            "title": title,
-            "description": description,
-            "location": {
-                "url": target["url"],
-                "parameter": target["injection_point"]["name"],
-                "injection_type": target["injection_point"]["type"],
-                "method": target.get("method", "GET")
-            },
-            "evidence": {
-                "payload": payload,
-                "indicators": indicators,
-                "response_excerpt": ""  # Would include relevant response portions
-            },
-            "remediation": remediation,
-            "confidence": confidence
-        }
-        
-        return vulnerability
-    
-    def _calculate_confidence(self, indicators: Dict[str, Any], vuln_type: str, payload: str) -> float:
-        """Calculate confidence score for vulnerability finding"""
-        confidence = 0.0
-        
-        # Base confidence on evidence strength
-        if indicators.get("payload_reflection", {}).get("found"):
-            confidence += 0.4
-        
-        if indicators.get("error_disclosure", {}).get("found"):
-            confidence += 0.5
-        
-        if indicators.get("timing_anomaly", {}).get("significant"):
-            confidence += 0.3
-        
-        # Adjust based on vulnerability type specifics
-        if vuln_type == VulnType.XSS.value:
-            reflection = indicators.get("payload_reflection", {})
-            if reflection.get("found") and not reflection.get("encoded"):
-                confidence += 0.3
-        
-        elif vuln_type == VulnType.SQLI.value:
-            error = indicators.get("error_disclosure", {})
-            if error.get("type") == "sql_error":
-                confidence += 0.4
-        
-        return min(confidence, 1.0)  # Cap at 1.0
-    
-    def _assess_severity(self, target: Dict[str, Any], vuln_type: str, indicators: Dict[str, Any]) -> Severity:
-        """Assess vulnerability severity based on type and context"""
-        # Base severity mappings
-        base_severity = {
-            VulnType.XSS.value: Severity.MEDIUM,
-            VulnType.SQLI.value: Severity.HIGH,
-            VulnType.SSRF.value: Severity.HIGH,
-            VulnType.LFI.value: Severity.MEDIUM,
-            VulnType.RCE.value: Severity.CRITICAL,
-            VulnType.XXE.value: Severity.HIGH
-        }
-        
-        severity = base_severity.get(vuln_type, Severity.MEDIUM)
-        
-        # Adjust severity based on context
-        url = target.get("url", "").lower()
-        
-        # Admin interfaces are more critical
-        if any(admin_path in url for admin_path in ["/admin", "/dashboard", "/panel"]):
-            if severity == Severity.MEDIUM:
-                severity = Severity.HIGH
-            elif severity == Severity.HIGH:
-                severity = Severity.CRITICAL
-        
-        # Authentication forms are critical
-        param_name = target.get("injection_point", {}).get("name", "").lower()
-        if any(auth_param in param_name for auth_param in ["password", "username", "login"]):
-            if severity == Severity.MEDIUM:
-                severity = Severity.HIGH
-        
-        return severity
-    
-    def _generate_title(self, target: Dict[str, Any], vuln_type: str, payload: str) -> str:
-        """Generate human-readable vulnerability title"""
-        vuln_names = {
-            VulnType.XSS.value: "Cross-Site Scripting (XSS)",
-            VulnType.SQLI.value: "SQL Injection",
-            VulnType.SSRF.value: "Server-Side Request Forgery (SSRF)",
-            VulnType.LFI.value: "Local File Inclusion (LFI)",
-            VulnType.RCE.value: "Remote Code Execution (RCE)",
-            VulnType.XXE.value: "XML External Entity (XXE)"
-        }
-        
-        vuln_name = vuln_names.get(vuln_type, vuln_type.upper())
-        param_name = target.get("injection_point", {}).get("name", "parameter")
-        
-        return f"{vuln_name} in '{param_name}' parameter"
-    
-    def _generate_description(self, vuln_type: str, payload: str, indicators: Dict[str, Any]) -> str:
-        """Generate detailed vulnerability description"""
-        descriptions = {
-            VulnType.XSS.value: f"The application reflects user input without proper encoding, allowing JavaScript execution. The payload '{payload}' was successfully reflected in the response.",
-            VulnType.SQLI.value: f"The application appears vulnerable to SQL injection. The payload '{payload}' triggered database errors or unusual behavior.",
-            VulnType.SSRF.value: f"The application may be vulnerable to Server-Side Request Forgery, allowing requests to internal services. The payload '{payload}' indicated potential SSRF behavior.",
-            VulnType.LFI.value: f"The application may allow reading of arbitrary files on the server. The payload '{payload}' showed signs of file inclusion vulnerability."
-        }
-        
-        base_desc = descriptions.get(vuln_type, f"Potential {vuln_type} vulnerability detected with payload: {payload}")
-        
-        # Add evidence details
-        evidence_details = []
-        if indicators.get("payload_reflection", {}).get("found"):
-            evidence_details.append("Payload was reflected in the response")
-        if indicators.get("error_disclosure", {}).get("found"):
-            error_type = indicators["error_disclosure"].get("type", "unknown")
-            evidence_details.append(f"Application disclosed {error_type} errors")
-        if indicators.get("timing_anomaly", {}).get("significant"):
-            evidence_details.append("Response timing anomalies detected")
-        
-        if evidence_details:
-            base_desc += " Evidence includes: " + ", ".join(evidence_details) + "."
-        
-        return base_desc
-    
-    def _generate_remediation(self, vuln_type: str, target: Dict[str, Any]) -> str:
-        """Generate remediation guidance"""
-        remediation_guides = {
-            VulnType.XSS.value: "Implement proper input validation and output encoding. Use Content Security Policy (CSP) headers to prevent script execution.",
-            VulnType.SQLI.value: "Use parameterized queries or prepared statements. Implement proper input validation and avoid dynamic SQL construction.",
-            VulnType.SSRF.value: "Implement URL validation and whitelist allowed destinations. Disable unused protocols and block internal network ranges.",
-            VulnType.LFI.value: "Implement proper input validation and use absolute paths. Avoid user-controlled file inclusion and use secure file handling functions."
-        }
-        
-        return remediation_guides.get(vuln_type, "Implement proper input validation and security controls.")
-    
-    async def comprehensive_scan(self, target_url: str) -> Dict[str, Any]:
-        """Run complete vulnerability scan against target"""
+
+    async def comprehensive_scan(self, target_url: str):
         logger.info(f"Starting comprehensive scan of {target_url}")
         
-        # Phase 1: Reconnaissance
-        attack_plan = await self.reconnaissance_phase(target_url)
-        
-        # Phase 2: Vulnerability Testing
-        all_findings = []
-        
-        for vuln_type in attack_plan["vulnerability_types"]:
-            logger.info(f"Testing for {vuln_type} vulnerabilities")
+        try:
+            attack_plan = await self.reconnaissance_phase(target_url)
+            all_findings = []
             
-            # Get prioritized targets for this vulnerability type
-            prioritized_indices = attack_plan["priority_order"]
-            prioritized_targets = [attack_plan["targets"][i] for i in prioritized_indices[:10]]  # Limit to top 10
+            # Limit vulnerability types tested (for demo, test only first 3)
+            vuln_types_to_test = attack_plan["vulnerability_types"][:3]
+            logger.info(f"Testing {len(vuln_types_to_test)} vulnerability types: {vuln_types_to_test}")
             
-            findings = await self.test_vulnerability_type(vuln_type, prioritized_targets)
-            all_findings.extend(findings)
+            for vuln_type in vuln_types_to_test:
+                try:
+                    self._check_scan_timeout()
+                    findings = await self.test_vulnerability_type(vuln_type, attack_plan["targets"])
+                    all_findings.extend(findings)
+                    
+                    for finding in findings:
+                        await self.mcp_server.call_tool("save_finding", {"vulnerability": finding})
+                        
+                except TimeoutError:
+                    logger.warning("Scan timeout reached, stopping comprehensive scan")
+                    break
+                except Exception as e:
+                    logger.error(f"Error testing {vuln_type}: {e}")
+                    continue
             
-            # Save findings as we discover them
-            for finding in findings:
-                await self.mcp_server.call_tool("save_finding", {"vulnerability": finding})
+            report = self._generate_report(target_url, all_findings, attack_plan)
+            scan_duration = time.time() - self.scan_start_time
+            logger.info(f"Scan complete in {scan_duration:.1f} seconds. Found {len(all_findings)} potential vulnerabilities")
+            return report
+            
+        except Exception as e:
+            logger.error(f"Comprehensive scan failed: {e}")
+            return self._generate_error_report(target_url, str(e))
+
+    def _generate_report(self, target_url: str, findings: List[Dict[str, Any]], attack_plan: Dict[str, Any]):
+        severity_counts = {s.value: 0 for s in Severity}
+        for f in findings:
+            severity = f.get("severity", "info")
+            if severity in severity_counts:
+                severity_counts[severity] += 1
         
-        # Phase 3: Generate comprehensive report
-        report = self._generate_report(target_url, all_findings, attack_plan)
+        scan_duration = time.time() - self.scan_start_time if self.scan_start_time else 0
         
-        logger.info(f"Scan complete. Found {len(all_findings)} potential vulnerabilities")
-        return report
-    
-    def _generate_report(self, target_url: str, findings: List[Dict[str, Any]], attack_plan: Dict[str, Any]) -> Dict[str, Any]:
-        """Generate comprehensive scan report"""
-        # Categorize findings by severity
-        severity_counts = {severity.value: 0 for severity in Severity}
-        for finding in findings:
-            severity_counts[finding["severity"]] += 1
-        
-        # Calculate risk score
-        risk_score = self._calculate_risk_score(findings)
-        
-        report = {
+        return {
             "scan_summary": {
-                "target": target_url,
+                "target": target_url, 
                 "timestamp": time.time(),
-                "total_findings": len(findings),
+                "scan_duration": scan_duration,
+                "total_findings": len(findings), 
                 "severity_breakdown": severity_counts,
-                "risk_score": risk_score,
+                "risk_score": self._calculate_risk_score(findings),
                 "targets_tested": len(attack_plan.get("targets", [])),
-                "vulnerability_types_tested": attack_plan.get("vulnerability_types", [])
             },
             "findings": findings,
-            "recommendations": self._generate_recommendations(findings),
             "attack_surface": {
                 "endpoints_discovered": len(self.context.get("endpoints", [])),
                 "forms_discovered": len(self.context.get("forms", [])),
-                "parameters_discovered": len(self.context.get("parameters", [])),
-                "technologies_detected": self.context.get("technologies", [])
+                "technologies": self.context.get("technologies", [])
             }
         }
-        
-        return report
-    
-    def _calculate_risk_score(self, findings: List[Dict[str, Any]]) -> float:
-        """Calculate overall risk score for the application"""
-        if not findings:
-            return 0.0
-        
-        severity_weights = {
-            Severity.CRITICAL.value: 10.0,
-            Severity.HIGH.value: 7.5,
-            Severity.MEDIUM.value: 5.0,
-            Severity.LOW.value: 2.5,
-            Severity.INFO.value: 1.0
+
+    def _generate_error_report(self, target_url: str, error_message: str):
+        """Generate a report when scan fails"""
+        return {
+            "scan_summary": {
+                "target": target_url,
+                "timestamp": time.time(),
+                "scan_duration": time.time() - self.scan_start_time if self.scan_start_time else 0,
+                "total_findings": 0,
+                "severity_breakdown": {s.value: 0 for s in Severity},
+                "risk_score": 0.0,
+                "error": error_message
+            },
+            "findings": [],
+            "attack_surface": {}
         }
-        
-        total_score = 0.0
-        for finding in findings:
-            severity = finding.get("severity", "info")
-            confidence = finding.get("confidence", 0.5)
-            weight = severity_weights.get(severity, 1.0)
-            total_score += weight * confidence
-        
-        # Normalize to 0-10 scale
-        max_possible = len(findings) * 10.0
-        return min((total_score / max_possible) * 10, 10.0) if max_possible > 0 else 0.0
-    
-    def _generate_recommendations(self, findings: List[Dict[str, Any]]) -> List[str]:
-        """Generate high-level security recommendations"""
-        recommendations = []
-        
-        # Count vulnerability types
-        vuln_counts = {}
-        for finding in findings:
-            vuln_type = finding.get("type", "unknown")
-            vuln_counts[vuln_type] = vuln_counts.get(vuln_type, 0) + 1
-        
-        # Generate recommendations based on findings
-        if VulnType.XSS.value in vuln_counts:
-            recommendations.append("Implement comprehensive input validation and output encoding throughout the application")
-            recommendations.append("Deploy Content Security Policy (CSP) headers to mitigate XSS attacks")
-        
-        if VulnType.SQLI.value in vuln_counts:
-            recommendations.append("Migrate to parameterized queries and prepared statements for all database interactions")
-            recommendations.append("Implement database-level access controls and principle of least privilege")
-        
-        if VulnType.SSRF.value in vuln_counts:
-            recommendations.append("Implement strict URL validation and whitelist allowed external services")
-            recommendations.append("Deploy network segmentation to limit server-side request capabilities")
-        
-        # General recommendations
-        if findings:
-            recommendations.extend([
-                "Conduct regular security code reviews and penetration testing",
-                "Implement a Web Application Firewall (WAF) as an additional layer of protection",
-                "Establish a vulnerability management program with regular security assessments"
-            ])
-        
-        return recommendations
+
+    def _calculate_risk_score(self, findings: List[Dict[str, Any]]):
+        if not findings: 
+            return 0.0
+        weights = {
+            Severity.CRITICAL.value: 10, 
+            Severity.HIGH.value: 7, 
+            Severity.MEDIUM.value: 4, 
+            Severity.LOW.value: 1, 
+            Severity.INFO.value: 0
+        }
+        score = sum(weights.get(f.get("severity"), 0) * f.get("confidence", 0.5) for f in findings)
+        return min(round(score / (len(findings) * 10) * 10, 1), 10.0) if findings else 0.0
 
 # =============================================================================
-# Main Execution and Usage Example
+# Enhanced Main Execution with better error handling and limits
 # =============================================================================
 
 async def main():
-    """Main function demonstrating usage of the MCP vulnerability scanner"""
+    target_url = "https://httpbin.org/forms/post"
     
-    # Configure the scanner with scope restrictions
-    target_url = "https://juice-shop.herokuapp.com/#/"  # Replace with actual target
+    # Set overall timeout for the entire operation
+    overall_timeout = 60  # 10 minutes maximum
     
-    # Initialize MCP server and agent
-    async with MCPServer() as mcp_server:
-        # Configure scope (important for safety!)
-        mcp_server.scope_validator.allowed_domains = ["juice-shop.herokuapp.com"]
-        mcp_server.scope_validator.blocked_paths = ["/admin", "/system", "/private"]
+    try:
+        logger.info("Initializing vulnerability scanner...")
+        ai_interface = AIInterface()
         
-        # Initialize AI agent
-        agent = VulnScanAgent(mcp_server)
-        
-        try:
-            # Run comprehensive vulnerability scan
-            logger.info("Starting comprehensive vulnerability scan...")
-            report = await agent.comprehensive_scan(target_url)
+        async with MCPServer(ai_interface) as mcp_server:
+            # Configure scope validation
+            domain = urllib.parse.urlparse(target_url).netloc
+            mcp_server.scope_validator.allowed_domains = [domain]
             
+            # Create agent with limits
+            agent = VulnScanAgent(
+                mcp_server, 
+                ai_interface, 
+                max_targets_per_vuln=5  # Limit targets per vulnerability type
+            )
+            
+            logger.info("Starting vulnerability scan using AI interface...")
+            
+            # Run scan with overall timeout
+            report = await asyncio.wait_for(
+                agent.comprehensive_scan(target_url),
+                timeout=overall_timeout
+            )
+            
+            logger.info("Scan completed. Processing results...")
+
             # Display results
             print("\n" + "="*80)
             print("VULNERABILITY SCAN REPORT")
             print("="*80)
-            print(f"Target: {report['scan_summary']['target']}")
-            print(f"Total Findings: {report['scan_summary']['total_findings']}")
-            print(f"Risk Score: {report['scan_summary']['risk_score']:.1f}/10.0")
+            
+            summary = report['scan_summary']
+            print(f"Target: {summary['target']}")
+            print(f"Scan Duration: {summary.get('scan_duration', 0):.1f} seconds")
+            print(f"Total Findings: {summary['total_findings']}")
+            print(f"Targets Tested: {summary.get('targets_tested', 0)}")
+            print(f"Risk Score: {summary['risk_score']:.1f}/10.0")
+            
+            if summary.get('error'):
+                print(f"Scan Error: {summary['error']}")
             
             print("\nSeverity Breakdown:")
-            for severity, count in report['scan_summary']['severity_breakdown'].items():
-                if count > 0:
+            for severity, count in summary['severity_breakdown'].items():
+                if count > 0: 
                     print(f"  {severity.upper()}: {count}")
             
+            attack_surface = report.get('attack_surface', {})
             print(f"\nAttack Surface:")
-            attack_surface = report['attack_surface']
-            print(f"  Endpoints: {attack_surface['endpoints_discovered']}")
-            print(f"  Forms: {attack_surface['forms_discovered']}")
-            print(f"  Parameters: {attack_surface['parameters_discovered']}")
-            print(f"  Technologies: {', '.join(attack_surface['technologies_detected'])}")
+            print(f"  Endpoints Discovered: {attack_surface.get('endpoints_discovered', 0)}")
+            print(f"  Forms Discovered: {attack_surface.get('forms_discovered', 0)}")
+            print(f"  Technologies: {', '.join(attack_surface.get('technologies', ['Unknown']))}")
             
             if report['findings']:
-                print(f"\nTop Vulnerabilities:")
+                print("\nTop Vulnerabilities:")
                 for i, finding in enumerate(report['findings'][:5], 1):
-                    print(f"  {i}. {finding['title']} - {finding['severity'].upper()} ({finding['confidence']:.1%} confidence)")
-            
-            print(f"\nKey Recommendations:")
-            for i, rec in enumerate(report['recommendations'][:3], 1):
-                print(f"  {i}. {rec}")
-            
-        except SecurityError as e:
-            logger.error(f"Security constraint violation: {e}")
-        except Exception as e:
-            logger.error(f"Scan failed: {e}")
+                    title = finding.get('title', 'Untitled Finding')
+                    severity = finding.get('severity', 'unknown').upper()
+                    confidence = finding.get('confidence', 0.0)
+                    confidence_str = f"({confidence:.1%} confidence)" if confidence > 0 else ""
+                    print(f"  {i}. {title} - {severity} {confidence_str}")
+            else:
+                print("\nNo vulnerabilities found.")
+                print("This could be due to:")
+                print("  - Target is well-secured")
+                print("  - Limited scan scope/depth")
+                print("  - AI interface connectivity issues")
+                print("  - Scan timeouts or rate limiting")
 
-# =============================================================================
-# Plugin System Example
-# =============================================================================
+    except asyncio.TimeoutError:
+        logger.error(f"Scan exceeded maximum time limit of {overall_timeout} seconds")
+        print(f"\nScan timed out after {overall_timeout} seconds. Consider:")
+        print("  - Reducing scan scope")
+        print("  - Increasing timeout limits")
+        print("  - Checking target responsiveness")
+        
+    except SecurityError as e:
+        logger.error(f"Security constraint violation: {e}")
+        print(f"\nSecurity Error: {e}")
+        print("Check your target URL and scope configuration.")
+        
+    except ValueError as e:
+        logger.error(f"Configuration error: {e}")
+        print(f"\nConfiguration Error: {e}")
+        print("Check your AI interface setup and parameters.")
+        
+    except Exception as e:
+        logger.error(f"Unexpected error during scan: {e}", exc_info=True)
+        print(f"\nUnexpected Error: {e}")
+        print("Check logs for detailed error information.")
+        print("Common issues:")
+        print("  - AI interface not properly configured")
+        print("  - Network connectivity problems")
+        print("  - Target server blocking requests")
+        print("  - Missing dependencies")
 
-class VulnScannerPlugin:
-    """Base class for vulnerability scanner plugins"""
-    
-    def __init__(self):
-        self.name = "base_plugin"
-        self.tools = {}
-    
-    def register_tools(self) -> Dict[str, callable]:
-        """Register additional MCP tools"""
-        return self.tools
-    
-    def process_finding(self, finding: Dict[str, Any]) -> Dict[str, Any]:
-        """Post-process vulnerability findings"""
-        return finding
-
-class ZAPIntegrationPlugin(VulnScannerPlugin):
-    """Example plugin for integrating OWASP ZAP scanner"""
-    
-    def __init__(self, zap_proxy_url: str = "http://localhost:8080"):
-        super().__init__()
-        self.name = "zap_integration"
-        self.zap_proxy_url = zap_proxy_url
-        self.tools = {
-            "zap_active_scan": self.zap_active_scan,
-            "zap_spider": self.zap_spider,
-            "zap_get_alerts": self.zap_get_alerts
-        }
-    
-    async def zap_active_scan(self, target_url: str) -> Dict[str, Any]:
-        """Trigger ZAP active scan"""
-        # Implementation would integrate with ZAP API
-        return {"status": "scan_started", "target": target_url}
-    
-    async def zap_spider(self, target_url: str) -> Dict[str, Any]:
-        """Trigger ZAP spider scan"""
-        # Implementation would integrate with ZAP API
-        return {"status": "spider_started", "target": target_url}
-    
-    async def zap_get_alerts(self, target_url: str) -> Dict[str, Any]:
-        """Retrieve ZAP alerts"""
-        # Implementation would retrieve ZAP findings
-        return {"alerts": [], "count": 0}
-
-# Entry point
 if __name__ == "__main__":
-    # Run the vulnerability scanner
     asyncio.run(main())
