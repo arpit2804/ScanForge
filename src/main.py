@@ -3,8 +3,8 @@ import json
 import re
 import time
 import urllib.parse
-from typing import Dict, List, Any, Optional, Union
-from dataclasses import dataclass, asdict
+from typing import Dict, List, Any, Optional
+from dataclasses import dataclass
 from enum import Enum
 import aiohttp
 import logging
@@ -19,11 +19,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # =============================================================================
-# Data Models and Enums
+# Data Models and Enums (Unchanged)
 # =============================================================================
 
 class Severity(Enum):
-    """Vulnerability severity levels"""
     CRITICAL = "critical"
     HIGH = "high"
     MEDIUM = "medium"
@@ -31,39 +30,12 @@ class Severity(Enum):
     INFO = "info"
 
 class VulnType(Enum):
-    """Supported vulnerability types"""
     XSS = "xss"
     SQLI = "sqli"
     SSRF = "ssrf"
     LFI = "lfi"
     RCE = "rce"
     XXE = "xxe"
-
-@dataclass
-class InjectionPoint:
-    """Represents where to inject payloads"""
-    type: str  # query_param, form_field, header, path, body
-    name: str
-    position: Optional[int] = None
-
-@dataclass
-class HttpRequest:
-    """HTTP request representation"""
-    method: str
-    url: str
-    headers: Dict[str, str]
-    body: str = ""
-    timeout: int = 10
-
-@dataclass
-class HttpResponse:
-    """HTTP response representation"""
-    status_code: int
-    headers: Dict[str, str]
-    body: str
-    response_time: float
-    size_bytes: int
-    redirect_chain: List[str]
 
 @dataclass
 class Vulnerability:
@@ -83,84 +55,60 @@ class Vulnerability:
             self.timestamp = time.time()
 
 # =============================================================================
-# Safety and Rate Limiting Components
+# Safety and Core Components (Enhanced with limits)
 # =============================================================================
 
 class RateLimiter:
     """Rate limiting to prevent overwhelming target servers"""
-    
     def __init__(self, requests_per_minute: int = 30):
         self.requests_per_minute = requests_per_minute
         self.requests = []
         self.lock = asyncio.Lock()
-    
+
     async def acquire(self):
-        """Acquire permission to make a request"""
         async with self.lock:
             now = time.time()
-            # Remove requests older than 1 minute
             self.requests = [req_time for req_time in self.requests if now - req_time < 60]
-            
             if len(self.requests) >= self.requests_per_minute:
-                # Wait until we can make another request
                 sleep_time = 60 - (now - self.requests[0])
                 if sleep_time > 0:
                     logger.info(f"Rate limit reached, sleeping for {sleep_time:.2f} seconds")
                     await asyncio.sleep(sleep_time)
-            
             self.requests.append(now)
 
 class ScopeValidator:
     """Validates that targets are within allowed testing scope"""
-    
     def __init__(self, allowed_domains: List[str] = None, blocked_paths: List[str] = None):
         self.allowed_domains = allowed_domains or []
         self.blocked_paths = blocked_paths or ['/admin', '/system', '/dev']
-        
-        # Dangerous patterns that should never be in payloads
-        self.dangerous_patterns = [
-            r'rm\s+-rf',          # File deletion commands
-            r'format\s+c:',       # Disk formatting
-            r'del\s+/[qsf]',      # Windows delete commands
-            r'DROP\s+DATABASE',   # Database destruction
-            r'TRUNCATE\s+TABLE',  # Table destruction
-        ]
-    
+        self.dangerous_patterns = [r'rm\s+-rf', r'format\s+c:', r'del\s+/[qsf]', r'DROP\s+DATABASE', r'TRUNCATE\s+TABLE']
+
     async def is_allowed(self, url: str) -> bool:
-        """Check if URL is within allowed scope"""
-        parsed = urllib.parse.urlparse(url)
-        domain = parsed.netloc.lower()
-        path = parsed.path
-        
-        # Check domain whitelist
-        if self.allowed_domains:
-            if not any(domain.endswith(allowed.lower()) for allowed in self.allowed_domains):
+        try:
+            parsed = urllib.parse.urlparse(url)
+            domain = parsed.netloc.lower()
+            path = parsed.path
+            
+            if self.allowed_domains and not any(domain.endswith(allowed.lower()) for allowed in self.allowed_domains):
                 logger.warning(f"Domain {domain} not in allowed list")
                 return False
-        
-        # Check blocked paths
-        for blocked_path in self.blocked_paths:
-            if path.startswith(blocked_path):
+            if any(path.startswith(blocked_path) for blocked_path in self.blocked_paths):
                 logger.warning(f"Path {path} is blocked")
                 return False
-        
-        return True
-    
+            return True
+        except Exception as e:
+            logger.error(f"Error validating URL {url}: {e}")
+            return False
+
     def is_payload_safe(self, payload: str) -> bool:
-        """Check if payload is safe to use"""
-        for pattern in self.dangerous_patterns:
-            if re.search(pattern, payload, re.IGNORECASE):
-                logger.warning(f"Dangerous payload pattern detected: {pattern}")
-                return False
+        if any(re.search(pattern, payload, re.IGNORECASE) for pattern in self.dangerous_patterns):
+            logger.warning(f"Dangerous payload pattern detected in: {payload}")
+            return False
         return True
 
 class SecurityError(Exception):
     """Raised when security constraints are violated"""
     pass
-
-# =============================================================================
-# MCP Server Implementation
-# =============================================================================
 
 class VulnerabilityDatabase:
     """File-based storage for vulnerability findings.
@@ -194,445 +142,314 @@ class VulnerabilityDatabase:
 
         return vuln_id
 
+# =============================================================================
+# PayloadDatabase to use AI
+# =============================================================================
 class PayloadDatabase:
-    """In-memory payload database with context-aware payload generation"""
-    
-    def __init__(self):
-        # Curated payloads for different vulnerability types
-        self.payloads = {
-            VulnType.XSS.value: [
-                "<script>alert('XSS')</script>",
-                "<img src=x onerror=alert('XSS')>",
-                "javascript:alert('XSS')",
-                "';alert('XSS');//",
-                "\"><script>alert('XSS')</script>",
-                "<svg onload=alert('XSS')>",
-                "<%2Fscript%3E%3Cscript%3Ealert(%27XSS%27)%3C%2Fscript%3E",
-            ],
-            VulnType.SQLI.value: [
-                "' OR '1'='1",
-                "'; DROP TABLE users;--",
-                "1' UNION SELECT null,null,null--",
-                "admin'--",
-                "' OR 1=1#",
-                "1' AND (SELECT SUBSTRING(@@version,1,1))='5'--",
-                "' WAITFOR DELAY '00:00:05'--",
-            ],
-            VulnType.SSRF.value: [
-                "http://169.254.169.254/latest/meta-data/",
-                "file:///etc/passwd",
-                "http://localhost:22",
-                "http://127.0.0.1:8080",
-                "gopher://127.0.0.1:3306/",
-                "dict://127.0.0.1:11211/",
-            ],
-            VulnType.LFI.value: [
-                "../../../etc/passwd",
-                "..\\..\\..\\windows\\system32\\drivers\\etc\\hosts",
-                "/etc/passwd%00",
-                "....//....//....//etc/passwd",
-                "%2e%2e%2f%2e%2e%2f%2e%2e%2fetc%2fpasswd",
-            ]
+    """Payload database that uses an LLM for context-aware payload generation"""
+    def __init__(self, ai_interface: AIInterface):
+        self.ai_interface = ai_interface
+        self.fallback_payloads = {
+            VulnType.XSS.value: ["<script>alert('XSS')</script>", "<img src=x onerror=alert('XSS')>"],
+            VulnType.SQLI.value: ["' OR '1'='1", "'; DROP TABLE users;--"],
         }
-    
-    def get_payloads(self, vuln_type: str, context: Dict[str, Any] = None, count: int = 10) -> List[str]:
-        """Get payloads for specific vulnerability type with context awareness"""
-        base_payloads = self.payloads.get(vuln_type, [])
-        
+
+    async def get_payloads(self, vuln_type: str, context: Dict[str, Any] = None, count: int = 10) -> List[str]:
         if not context:
-            return base_payloads[:count]
-        
-        # Context-aware payload modification
-        filtered_payloads = []
-        technology = context.get('technology', '').lower()
-        input_type = context.get('input_type', '').lower()
-        
-        for payload in base_payloads:
-            # Modify payloads based on detected technology
-            if vuln_type == VulnType.SQLI.value:
-                if 'mysql' in technology:
-                    payload = payload.replace('#', '-- ')
-                elif 'oracle' in technology:
-                    payload = payload.replace('--', '/**/').replace('#', '/**/')
-            
-            # Modify based on input type
-            if input_type == 'json' and vuln_type == VulnType.XSS.value:
-                payload = payload.replace('"', '\\"')
-            
-            filtered_payloads.append(payload)
-        
-        return filtered_payloads[:count]
+            return self.fallback_payloads.get(vuln_type, [])[:count]
+        try:
+            # Add timeout for AI payload generation
+            payloads = await asyncio.wait_for(
+                self.ai_interface.generate_payloads(vuln_type, context, count),
+                timeout=30.0  # 30 second timeout
+            )
+            if payloads:
+                return payloads
+        except asyncio.TimeoutError:
+            logger.warning("AI payload generation timed out. Using fallback payloads.")
+        except Exception as e:
+            logger.warning(f"AI payload generation failed: {e}. Using fallback payloads.")
+        return self.fallback_payloads.get(vuln_type, [])[:count]
+
 
 class WebCrawler:
-    """Web crawler for discovering attack surface"""
-    
-    def __init__(self, session: aiohttp.ClientSession):
+    """Web crawler using BeautifulSoup for robust parsing with limits."""
+    def __init__(self, session: aiohttp.ClientSession, max_pages: int = 50, max_depth: int = 3):
         self.session = session
         self.visited_urls = set()
         self.discovered_endpoints = []
         self.discovered_forms = []
-    
-    async def crawl_site(self, seed_url: str, depth: int = 2, scope_domains: List[str] = None) -> Dict[str, Any]:
-        """Crawl website to discover endpoints and attack surface"""
-        logger.info(f"Starting crawl of {seed_url} with depth {depth}")
+        self.page_bodies = {}
+        self.max_pages = max_pages  # Limit total pages crawled
+        self.max_depth = max_depth  # Limit crawl depth
+        self.pages_crawled = 0
+
+    async def crawl_site(self, seed_url: str, depth: int = 2, scope_domains: List[str] = None):
+        # Enforce maximum depth limit
+        depth = min(depth, self.max_depth)
+        logger.info(f"Starting crawl of {seed_url} with depth {depth} (max pages: {self.max_pages})")
         
-        self.visited_urls.clear()
-        self.discovered_endpoints.clear()
-        self.discovered_forms.clear()
+        base_domain = urllib.parse.urlparse(seed_url).netloc
+        await self._crawl_recursive(seed_url, depth, scope_domains or [base_domain])
         
-        await self._crawl_recursive(seed_url, depth, scope_domains or [])
-        
+        logger.info(f"Crawl completed. Visited {len(self.visited_urls)} pages, found {len(self.discovered_endpoints)} endpoints, {len(self.discovered_forms)} forms")
         return {
             "endpoints": self.discovered_endpoints,
             "forms": self.discovered_forms,
-            "static_analysis": {
-                "js_endpoints": [],  # Would extract from JavaScript files
-                "comments": [],      # Would extract HTML comments
-                "technologies": self._detect_technologies()
-            }
         }
-    
-    async def _crawl_recursive(self, url: str, depth: int, scope_domains: List[str]):
-        """Recursive crawling with depth limiting"""
-        if depth <= 0 or url in self.visited_urls:
-            return
-        
-        parsed_url = urllib.parse.urlparse(url)
-        if scope_domains and not any(parsed_url.netloc.endswith(domain) for domain in scope_domains):
-            return
-        
-        self.visited_urls.add(url)
-        
+
+    def _extract_forms(self, soup: BeautifulSoup, base_url: str):
+        forms = soup.find_all('form')
+        logger.debug(f"Found {len(forms)} forms on {base_url}")
+        for form in forms:
+            try:
+                action = form.get('action', '')
+                method = form.get('method', 'GET').upper()
+                action_url = urllib.parse.urljoin(base_url, action)
+                inputs = []
+                for input_tag in form.find_all(['input', 'textarea', 'select']):
+                    name = input_tag.get('name')
+                    if name:
+                        inputs.append({"name": name, "type": input_tag.get('type', 'text')})
+                form_data = {"action": action_url, "method": method, "inputs": inputs}
+                if form_data not in self.discovered_forms:
+                    self.discovered_forms.append(form_data)
+            except Exception as e:
+                logger.warning(f"Error extracting form from {base_url}: {e}")
+
+    def _extract_links(self, soup: BeautifulSoup, base_url: str):
+        urls = set()
         try:
-            async with self.session.get(url, timeout=10) as response:
-                if response.status == 200:
-                    content = await response.text()
-                    
-                    # Extract endpoint information
-                    endpoint_info = {
-                        "url": url,
-                        "method": "GET",
-                        "parameters": self._extract_parameters(url),
-                        "headers_observed": dict(response.headers),
-                        "forms": [],
-                        "technology_stack": []
-                    }
-                    self.discovered_endpoints.append(endpoint_info)
-                    
-                    # Extract forms
-                    forms = self._extract_forms(content, url)
-                    self.discovered_forms.extend(forms)
-                    
-                    # Extract links for further crawling
-                    if depth > 1:
-                        links = self._extract_links(content, url)
-                        for link in links[:10]:  # Limit to prevent infinite crawling
-                            await self._crawl_recursive(link, depth - 1, scope_domains)
+            # Limit link extraction to avoid excessive processing
+            max_links = 100  # Limit number of links per page
+            link_count = 0
+            
+            # <a href>
+            for tag in soup.find_all('a', href=True):
+                if link_count >= max_links:
+                    break
+                urls.add(urllib.parse.urljoin(base_url, tag['href']))
+                link_count += 1
+            
+            # <form action> (already limited by form extraction)
+            for tag in soup.find_all('form', action=True):
+                urls.add(urllib.parse.urljoin(base_url, tag['action']))
+                
+        except Exception as e:
+            logger.warning(f"Error extracting links from {base_url}: {e}")
         
+        return urls
+
+    async def _crawl_recursive(self, url: str, depth: int, scope_domains: List[str]):
+        # Check limits first
+        if (depth <= 0 or 
+            url in self.visited_urls or 
+            self.pages_crawled >= self.max_pages):
+            return
+            
+        try:
+            parsed_url = urllib.parse.urlparse(url)
+            if not any(domain in parsed_url.netloc for domain in scope_domains):
+                return
+                
+            self.visited_urls.add(url)
+            self.pages_crawled += 1
+            
+            logger.debug(f"Crawling {url} (depth: {depth}, pages crawled: {self.pages_crawled})")
+            
+            async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                if response.status == 200 and 'text/html' in response.headers.get('Content-Type', ''):
+                    content = await response.text()
+                    # Limit content size to prevent memory issues
+                    if len(content) > 1024 * 1024:  # 1MB limit
+                        content = content[:1024 * 1024]
+                        
+                    self.page_bodies[url] = content
+                    soup = BeautifulSoup(content, 'html.parser')
+                    
+                    # Discover endpoints from URL parameters
+                    query_params = list(urllib.parse.parse_qs(parsed_url.query).keys())
+                    if query_params:  # Only add if there are parameters
+                        endpoint_info = {
+                            "url": url, 
+                            "method": "GET",
+                            "parameters": query_params
+                        }
+                        if endpoint_info not in self.discovered_endpoints:
+                            self.discovered_endpoints.append(endpoint_info)
+                    
+                    # Discover forms on the page
+                    self._extract_forms(soup, url)
+                    
+                    # Continue crawling if we haven't hit limits
+                    if depth > 1 and self.pages_crawled < self.max_pages:
+                        links = self._extract_links(soup, url)
+                        # Limit concurrent crawling to prevent overwhelming
+                        semaphore = asyncio.Semaphore(5)  # Max 5 concurrent requests
+                        
+                        async def crawl_with_semaphore(link):
+                            async with semaphore:
+                                await self._crawl_recursive(link, depth - 1, scope_domains)
+                        
+                        # Process links in batches to avoid creating too many tasks
+                        links_list = list(links)[:20]  # Limit to 20 links per page
+                        await asyncio.gather(*[crawl_with_semaphore(link) for link in links_list], return_exceptions=True)
+                        
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout crawling {url}")
         except Exception as e:
             logger.warning(f"Error crawling {url}: {e}")
-    
-    def _extract_parameters(self, url: str) -> List[str]:
-        """Extract query parameters from URL"""
-        parsed = urllib.parse.urlparse(url)
-        return list(urllib.parse.parse_qs(parsed.query).keys())
-    
-    def _extract_forms(self, html: str, base_url: str) -> List[Dict[str, Any]]:
-        """Extract forms from HTML content"""
-        # Simplified form extraction - in practice, use BeautifulSoup
-        forms = []
-        
-        # Basic regex-based form extraction (use proper HTML parser in production)
-        form_pattern = r'<form[^>]*action=["\']?([^"\'>\s]+)[^>]*>(.*?)</form>'
-        input_pattern = r'<input[^>]*name=["\']([^"\']+)["\'][^>]*type=["\']([^"\']+)["\'][^>]*>'
-        
-        for match in re.finditer(form_pattern, html, re.DOTALL | re.IGNORECASE):
-            action = match.group(1)
-            form_content = match.group(2)
-            
-            # Resolve relative URLs
-            if not action.startswith('http'):
-                action = urllib.parse.urljoin(base_url, action)
-            
-            inputs = []
-            for input_match in re.finditer(input_pattern, form_content, re.IGNORECASE):
-                inputs.append({
-                    "name": input_match.group(1),
-                    "type": input_match.group(2)
-                })
-            
-            forms.append({
-                "action": action,
-                "method": "POST",  # Default assumption
-                "inputs": inputs
-            })
-        
-        return forms
-    
-    def _extract_links(self, html: str, base_url: str) -> List[str]:
-        """Extract links from HTML content"""
-        links = []
-        link_pattern = r'<a[^>]*href=["\']([^"\']+)["\'][^>]*>'
-        
-        for match in re.finditer(link_pattern, html, re.IGNORECASE):
-            href = match.group(1)
-            if href.startswith('http'):
-                links.append(href)
-            elif not href.startswith('#') and not href.startswith('javascript:'):
-                links.append(urllib.parse.urljoin(base_url, href))
-        
-        return links
-    
-    def _detect_technologies(self) -> List[str]:
-        """Detect technologies from headers and content"""
-        # In practice, integrate with Wappalyzer or similar
-        return ["nginx", "php"]  # Placeholder
 
+# =============================================================================
+# MCPServer with enhanced limits
+# =============================================================================
 class MCPServer:
     """Main MCP Server handling all vulnerability scanning operations"""
     
     def __init__(self,ai_interface: AIInterface):
         self.rate_limiter = RateLimiter(requests_per_minute=30)
         self.scope_validator = ScopeValidator()
-        self.payload_db = PayloadDatabase()
+        self.payload_db = PayloadDatabase(ai_interface)
         self.vuln_db = VulnerabilityDatabase()
-        
-        # HTTP session for making requests
         self.session = None
-        
-        # Available MCP tools
         self.tools = {
-            "crawl_site": self.crawl_site,
-            "send_request": self.send_request,
-            "inject_payload": self.inject_payload,
-            "analyze_response": self.analyze_response,
-            "save_finding": self.save_finding,
-            "get_payloads": self.get_payloads,
+            "crawl_site": self.crawl_site, "send_request": self.send_request,
+            "inject_payload": self.inject_payload, "analyze_response": self.analyze_response,
+            "save_finding": self.save_finding, "get_payloads": self.get_payloads,
             "validate_target": self.validate_target,
         }
-    
+
     async def __aenter__(self):
-        """Async context manager entry"""
-        self.session = aiohttp.ClientSession()
+        # Configure session with timeouts
+        timeout = aiohttp.ClientTimeout(total=30, connect=10)
+        self.session = aiohttp.ClientSession(timeout=timeout)
         return self
-    
+
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Async context manager exit"""
-        if self.session:
+        if self.session: 
             await self.session.close()
-    
+
     async def call_tool(self, tool_name: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Main entry point for calling MCP tools"""
-        if tool_name not in self.tools:
+        if tool_name not in self.tools: 
             raise ValueError(f"Unknown tool: {tool_name}")
-        
-        # Apply safety checks for dangerous operations
         await self._validate_request(tool_name, params)
-        
-        # Call the appropriate tool
         tool_func = self.tools[tool_name]
-        result = await tool_func(**params)
-        
-        logger.info(f"Tool {tool_name} executed successfully")
-        return result
-    
+        try:
+            # Add timeout for tool execution
+            result = await asyncio.wait_for(tool_func(**params), timeout=60.0)
+            logger.info(f"Tool {tool_name} executed successfully")
+            return result
+        except asyncio.TimeoutError:
+            logger.error(f"Tool {tool_name} timed out")
+            return {"error": "Tool execution timed out"}
+
     async def _validate_request(self, tool_name: str, params: Dict[str, Any]):
-        """Validate request for safety and scope compliance"""
         if tool_name in ['inject_payload', 'send_request']:
-            # Validate URL scope
             url = params.get('url')
             if url and not await self.scope_validator.is_allowed(url):
                 raise SecurityError("Target outside allowed scope")
-            
-            # Check dangerous payloads
             payload = params.get('payload')
             if payload and not self.scope_validator.is_payload_safe(payload):
                 raise SecurityError("Dangerous payload detected")
-            
-            # Apply rate limiting
             await self.rate_limiter.acquire()
-    
-    async def crawl_site(self, seed_url: str, depth: int = 2, scope_domains: List[str] = None, 
-                        follow_forms: bool = True, extract_js_urls: bool = True) -> Dict[str, Any]:
-        """Crawl website to discover attack surface"""
-        crawler = WebCrawler(self.session)
+
+    async def crawl_site(self, seed_url: str, depth: int = 2, scope_domains: List[str] = None):
+        # Limit crawl parameters
+        depth = min(depth, 3)  # Max depth of 3
+        crawler = WebCrawler(self.session, max_pages=50, max_depth=depth)
         return await crawler.crawl_site(seed_url, depth, scope_domains)
     
-    async def send_request(self, method: str, url: str, headers: Dict[str, str] = None, 
-                          body: str = "", follow_redirects: bool = True, timeout: int = 10) -> Dict[str, Any]:
-        """Send HTTP request and capture response"""
+    async def send_request(self, method: str, url: str, headers: Dict[str, str] = None, body: Any = None, **kwargs):
         start_time = time.time()
-        redirect_chain = []
-        
         try:
-            async with self.session.request(
-                method=method,
-                url=url,
-                headers=headers or {},
-                data=body,
-                allow_redirects=follow_redirects,
-                timeout=timeout
-            ) as response:
+            # For form submissions, body might be a dict
+            if isinstance(body, dict):
+                headers = headers or {}
+                headers.setdefault('Content-Type', 'application/x-www-form-urlencoded')
+                body = urllib.parse.urlencode(body)
+
+            # Add timeout to individual requests
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with self.session.request(method=method, url=url, headers=headers or {}, 
+                                          data=body, timeout=timeout, **kwargs) as response:
                 response_body = await response.text()
-                response_time = time.time() - start_time
-                
-                # Track redirects
-                if hasattr(response, 'history'):
-                    redirect_chain = [str(r.url) for r in response.history]
-                
                 return {
-                    "status_code": response.status,
-                    "headers": dict(response.headers),
+                    "status_code": response.status, 
+                    "headers": dict(response.headers), 
                     "body": response_body,
-                    "response_time": response_time,
-                    "redirect_chain": redirect_chain,
-                    "size_bytes": len(response_body.encode('utf-8')),
-                    "tls_info": {"version": "TLSv1.3", "cipher": "AES256-GCM"}  # Placeholder
+                    "response_time": time.time() - start_time,
                 }
-        
-        except asyncio.TimeoutError:
-            return {"error": "Request timeout", "response_time": time.time() - start_time}
         except Exception as e:
+            logger.warning(f"Request failed for {url}: {e}")
             return {"error": str(e), "response_time": time.time() - start_time}
     
-    async def inject_payload(self, url: str, injection_point: Dict[str, Any], payload: str, 
-                           method: str = "GET", encode: bool = False) -> Dict[str, Any]:
-        """Inject payload into specific parameter or location"""
-        if encode:
-            payload = urllib.parse.quote(payload)
-        
-        # Prepare request based on injection point type
-        headers = {}
-        body = ""
-        modified_url = url
-        
-        injection_type = injection_point.get('type')
-        param_name = injection_point.get('name')
-        
-        if injection_type == 'query_param':
-            # Inject into URL query parameter
-            parsed = urllib.parse.urlparse(url)
-            params = urllib.parse.parse_qs(parsed.query)
-            params[param_name] = [payload]
-            new_query = urllib.parse.urlencode(params, doseq=True)
-            modified_url = urllib.parse.urlunparse(
-                (parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment)
-            )
-        
-        elif injection_type == 'header':
-            headers[param_name] = payload
-        
-        elif injection_type == 'form_field':
-            # Inject into form data
-            body = urllib.parse.urlencode({param_name: payload})
-            headers['Content-Type'] = 'application/x-www-form-urlencoded'
-            method = 'POST'
-        
-        # Send the crafted request
-        return await self.send_request(method, modified_url, headers, body)
-    
-    async def analyze_response(self, request: Dict[str, Any], response: Dict[str, Any], 
-                             vulnerability_types: List[str] = None, context: Dict[str, Any] = None) -> Dict[str, Any]:
-        """Analyze HTTP response for vulnerability indicators"""
-        indicators = {}
-        payload = request.get('payload', '')
-        response_body = response.get('body', '')
-        response_headers = response.get('headers', {})
-        status_code = response.get('status_code', 0)
-        response_time = response.get('response_time', 0)
-        
-        # Check for payload reflection
-        indicators['payload_reflection'] = {
-            "found": payload in response_body or payload in str(response_headers),
-            "locations": [],
-            "context": "",
-            "encoded": False
-        }
-        
-        if indicators['payload_reflection']['found']:
-            if payload in response_body:
-                indicators['payload_reflection']['locations'].append('body')
-            if payload in str(response_headers):
-                indicators['payload_reflection']['locations'].append('headers')
-        
-        # Check for error disclosure
-        error_patterns = {
-            'sql_error': [
-                r'SQL syntax.*MySQL',
-                r'Warning.*mysql_.*',
-                r'valid MySQL result',
-                r'PostgreSQL.*ERROR',
-                r'Warning.*pg_.*',
-                r'valid PostgreSQL result'
-            ],
-            'php_error': [
-                r'<b>Fatal error</b>:.*in <b>',
-                r'<b>Warning</b>:.*in <b>',
-                r'<b>Parse error</b>:.*in <b>'
-            ],
-            'asp_error': [
-                r'Microsoft VBScript runtime error',
-                r'Microsoft JET Database Engine error'
-            ]
-        }
-        
-        indicators['error_disclosure'] = {"found": False, "type": "", "message": ""}
-        
-        for error_type, patterns in error_patterns.items():
-            for pattern in patterns:
-                if re.search(pattern, response_body, re.IGNORECASE):
-                    indicators['error_disclosure'] = {
-                        "found": True,
-                        "type": error_type,
-                        "message": re.search(pattern, response_body, re.IGNORECASE).group(0)[:100],
-                        "stack_trace": False
-                    }
-                    break
-        
-        # Check for timing anomalies (basic implementation)
-        baseline_time = context.get('baseline_response_time', 0.5) if context else 0.5
-        indicators['timing_anomaly'] = {
-            "baseline_ms": baseline_time * 1000,
-            "current_ms": response_time * 1000,
-            "significant": response_time > baseline_time * 3
-        }
-        
-        # Status code changes
-        baseline_status = context.get('baseline_status_code', 200) if context else 200
-        indicators['status_changes'] = {
-            "baseline": baseline_status,
-            "current": status_code
-        }
-        
-        return {"indicators": indicators}
-    
-    async def get_payloads(self, vulnerability_type: str, context: Dict[str, Any] = None, count: int = 10) -> Dict[str, Any]:
-        """Get payloads for specific vulnerability types"""
-        payloads = self.payload_db.get_payloads(vulnerability_type, context, count)
-        return {"payloads": payloads, "total": len(payloads)}
-    
-    async def save_finding(self, vulnerability: Dict[str, Any]) -> Dict[str, Any]:
-        """Save vulnerability finding to database"""
-        vuln = Vulnerability(**vulnerability)
-        target_url = vulnerability.get('location', {}).get('url', 'unknown')
-        vuln_id = await self.vuln_db.save_finding(vuln, target_url)
-        return {"id": vuln_id, "status": "saved"}
-    
-    async def validate_target(self, url: str, scope_rules: Dict[str, Any] = None) -> Dict[str, Any]:
-        """Validate if target is in scope and safe to test"""
-        if scope_rules:
-            # Update scope validator with custom rules
-            allowed_domains = scope_rules.get('allowed_domains', [])
-            if allowed_domains:
-                self.scope_validator.allowed_domains = allowed_domains
-        
-        is_valid = await self.scope_validator.is_allowed(url)
-        return {"valid": is_valid, "url": url}
+    async def inject_payload(self, url: str, injection_point: Dict[str, Any], payload: str, method: str = "GET", **kwargs):
+        try:
+            modified_url = url
+            headers = kwargs.get('headers', {})
+            body = kwargs.get('data', None)
+
+            if injection_point['type'] == 'query_param':
+                parsed = urllib.parse.urlparse(url)
+                params = urllib.parse.parse_qs(parsed.query)
+                params[injection_point['name']] = [payload]
+                new_query = urllib.parse.urlencode(params, doseq=True)
+                modified_url = parsed._replace(query=new_query).geturl()
+                return await self.send_request(method, modified_url, headers, body)
+            
+            elif injection_point['type'] == 'form_field':
+                body = {injection_point['name']: payload}
+                return await self.send_request(method, modified_url, headers, body)
+
+            return await self.send_request(method, modified_url, headers, body)
+        except Exception as e:
+            logger.error(f"Payload injection failed: {e}")
+            return {"error": str(e)}
+
+    async def analyze_response(self, request: Dict[str, Any], response: Dict[str, Any], **kwargs) -> Dict[str, Any]:
+        try:
+            indicators = {}
+            payload = request.get('payload', '')
+            response_body = response.get('body', '')
+            
+            # Basic analysis
+            indicators['payload_reflection'] = {"found": payload in response_body}
+            sql_error_patterns = [r'SQL syntax.*MySQL', r'Warning.*mysql_', r'ORA-\d+', r'Microsoft.*ODBC.*SQL']
+            indicators['error_disclosure'] = {"found": any(re.search(p, response_body, re.I) for p in sql_error_patterns)}
+            
+            return {"indicators": indicators}
+        except Exception as e:
+            logger.error(f"Response analysis failed: {e}")
+            return {"indicators": {}}
+
+    async def get_payloads(self, vulnerability_type: str, context: Dict[str, Any] = None, count: int = 10):
+        # Limit payload count
+        count = min(count, 5)  # Max 5 payloads per request
+        payloads = await self.payload_db.get_payloads(vulnerability_type, context, count)
+        return {"payloads": payloads}
+
+    async def save_finding(self, vulnerability: Dict[str, Any]):
+        try:
+            target_url = vulnerability.get('location', {}).get('url', 'unknown')
+            vuln_id = await self.vuln_db.save_finding(vulnerability, target_url)
+            return {"id": vuln_id, "status": "saved"}
+        except Exception as e:
+            logger.error(f"Failed to save finding: {e}")
+            return {"error": str(e)}
+
+    async def validate_target(self, url: str, scope_rules: Dict[str, Any] = None):
+        try:
+            if scope_rules and 'allowed_domains' in scope_rules:
+                self.scope_validator.allowed_domains = scope_rules['allowed_domains']
+            is_valid = await self.scope_validator.is_allowed(url)
+            return {"valid": is_valid, "url": url}
+        except Exception as e:
+            logger.error(f"Target validation failed: {e}")
+            return {"valid": False, "url": url}
 
 # =============================================================================
-# LLM Agent Implementation
+# Enhanced VulnScanAgent with limits and timeouts
 # =============================================================================
-
 class VulnScanAgent:
     """
     A 'smart' agent that uses an AI 'brain' (AIInterface)
@@ -779,7 +596,7 @@ class VulnScanAgent:
         return result
     
 # =============================================================================
-# Main Execution and Usage Example
+# Enhanced Main Execution with better error handling and limits
 # =============================================================================
 
 async def main():
@@ -815,50 +632,32 @@ async def main():
 # Plugin System Example
 # =============================================================================
 
-class VulnScannerPlugin:
-    """Base class for vulnerability scanner plugins"""
-    
-    def __init__(self):
-        self.name = "base_plugin"
-        self.tools = {}
-    
-    def register_tools(self) -> Dict[str, callable]:
-        """Register additional MCP tools"""
-        return self.tools
-    
-    def process_finding(self, finding: Dict[str, Any]) -> Dict[str, Any]:
-        """Post-process vulnerability findings"""
-        return finding
+    except asyncio.TimeoutError:
+        logger.error(f"Scan exceeded maximum time limit of {overall_timeout} seconds")
+        print(f"\nScan timed out after {overall_timeout} seconds. Consider:")
+        print("  - Reducing scan scope")
+        print("  - Increasing timeout limits")
+        print("  - Checking target responsiveness")
+        
+    except SecurityError as e:
+        logger.error(f"Security constraint violation: {e}")
+        print(f"\nSecurity Error: {e}")
+        print("Check your target URL and scope configuration.")
+        
+    except ValueError as e:
+        logger.error(f"Configuration error: {e}")
+        print(f"\nConfiguration Error: {e}")
+        print("Check your AI interface setup and parameters.")
+        
+    except Exception as e:
+        logger.error(f"Unexpected error during scan: {e}", exc_info=True)
+        print(f"\nUnexpected Error: {e}")
+        print("Check logs for detailed error information.")
+        print("Common issues:")
+        print("  - AI interface not properly configured")
+        print("  - Network connectivity problems")
+        print("  - Target server blocking requests")
+        print("  - Missing dependencies")
 
-class ZAPIntegrationPlugin(VulnScannerPlugin):
-    """Example plugin for integrating OWASP ZAP scanner"""
-    
-    def __init__(self, zap_proxy_url: str = "http://localhost:8080"):
-        super().__init__()
-        self.name = "zap_integration"
-        self.zap_proxy_url = zap_proxy_url
-        self.tools = {
-            "zap_active_scan": self.zap_active_scan,
-            "zap_spider": self.zap_spider,
-            "zap_get_alerts": self.zap_get_alerts
-        }
-    
-    async def zap_active_scan(self, target_url: str) -> Dict[str, Any]:
-        """Trigger ZAP active scan"""
-        # Implementation would integrate with ZAP API
-        return {"status": "scan_started", "target": target_url}
-    
-    async def zap_spider(self, target_url: str) -> Dict[str, Any]:
-        """Trigger ZAP spider scan"""
-        # Implementation would integrate with ZAP API
-        return {"status": "spider_started", "target": target_url}
-    
-    async def zap_get_alerts(self, target_url: str) -> Dict[str, Any]:
-        """Retrieve ZAP alerts"""
-        # Implementation would retrieve ZAP findings
-        return {"alerts": [], "count": 0}
-
-# Entry point
 if __name__ == "__main__":
-    # Run the vulnerability scanner
     asyncio.run(main())
