@@ -8,12 +8,11 @@ from dataclasses import dataclass
 from enum import Enum
 import aiohttp
 import logging
+from abc import ABC, abstractmethod
+from contextlib import asynccontextmanager
 import hashlib
-import sqlite3
-from bs4 import BeautifulSoup
-
-# Import the new AI Interface
-from AIInterface import AIInterface
+import os
+from src.AIInterface import AIInterface
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -112,51 +111,35 @@ class SecurityError(Exception):
     pass
 
 class VulnerabilityDatabase:
-    """SQLite database for storing vulnerability findings"""
-    def __init__(self, db_path: str = "vulnerabilities.db"):
-        self.db_path = db_path
-        self.init_database()
+    """File-based storage for vulnerability findings.
 
-    def init_database(self):
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS vulnerabilities (
-                    id TEXT PRIMARY KEY, type TEXT NOT NULL, severity TEXT NOT NULL,
-                    title TEXT NOT NULL, description TEXT, location TEXT, evidence TEXT,
-                    remediation TEXT, confidence REAL, timestamp REAL, target_url TEXT
-                )
-            """)
-            conn.commit()
+    Findings are saved as individual JSON files named by a short
+    SHA256-derived id in the configured output directory.
+    """
+
+    def __init__(self, output_dir: str = "output"):
+        self.output_dir = output_dir
+        os.makedirs(self.output_dir, exist_ok=True)
 
     async def save_finding(self, vulnerability: Vulnerability, target_url: str):
-        # The vulnerability object from the AI might not have all keys
-        vuln_data = {
-            "type": vulnerability.get('type', 'unknown'),
-            "severity": vulnerability.get('severity', 'info'),
-            "title": vulnerability.get('title', 'Untitled Finding'),
-            "description": vulnerability.get('description', ''),
-            "location": vulnerability.get('location', {}),
-            "evidence": vulnerability.get('evidence', {}),
-            "remediation": vulnerability.get('remediation', ''),
-            "confidence": vulnerability.get('confidence', 0.0),
-            "timestamp": time.time()
-        }
-        vuln_id = hashlib.sha256(f"{vuln_data['type']}_{json.dumps(vuln_data['location'])}_{target_url}".encode()).hexdigest()[:16]
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("""
-                INSERT OR REPLACE INTO vulnerabilities
-                (id, type, severity, title, description, location, evidence,
-                 remediation, confidence, timestamp, target_url)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                vuln_id, vuln_data['type'], vuln_data['severity'],
-                vuln_data['title'], vuln_data['description'],
-                json.dumps(vuln_data['location']), json.dumps(vuln_data['evidence']),
-                vuln_data['remediation'], vuln_data['confidence'],
-                vuln_data['timestamp'], target_url
-            ))
-            conn.commit()
-        logger.info(f"Saved vulnerability finding: {vuln_id}")
+        """Save vulnerability finding to `output_dir` as a JSON file."""
+        vuln_id = hashlib.sha256(
+            f"{vulnerability.type}_{vulnerability.location}_{target_url}".encode()
+        ).hexdigest()[:16]
+
+        file_path = os.path.join(self.output_dir, f"{vuln_id}.json")
+
+        data = asdict(vulnerability)
+        data['target_url'] = target_url
+
+        try:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            logger.info(f"Saved vulnerability finding to {file_path}")
+        except Exception as e:
+            logger.error(f"Failed to save finding {vuln_id} to {file_path}: {e}")
+            raise
+
         return vuln_id
 
 # =============================================================================
@@ -322,7 +305,8 @@ class WebCrawler:
 # =============================================================================
 class MCPServer:
     """Main MCP Server handling all vulnerability scanning operations"""
-    def __init__(self, ai_interface: AIInterface):
+    
+    def __init__(self,ai_interface: AIInterface):
         self.rate_limiter = RateLimiter(requests_per_minute=30)
         self.scope_validator = ScopeValidator()
         self.payload_db = PayloadDatabase(ai_interface)
@@ -467,334 +451,186 @@ class MCPServer:
 # Enhanced VulnScanAgent with limits and timeouts
 # =============================================================================
 class VulnScanAgent:
-    """AI agent that orchestrates vulnerability scanning using MCP tools and AI reasoning"""
-    def __init__(self, mcp_server: MCPServer, ai_interface: AIInterface, max_targets_per_vuln: int = 10):
-        self.mcp_server = mcp_server
+    """
+    A 'smart' agent that uses an AI 'brain' (AIInterface)
+    to call tools on a remote 'body' (MCPServer).
+    """
+    
+    def __init__(self, mcp_server_url: str, ai_interface: AIInterface):
         self.ai_interface = ai_interface
-        self.context = {}
-        self.attack_plan = {}
-        self.max_targets_per_vuln = max_targets_per_vuln  # Limit targets per vulnerability type
-        self.scan_start_time = None
-        self.max_scan_duration = 300  # 5 minutes maximum scan time
+        self.mcp_server_url = mcp_server_url
+        self.mcp_session = None
+        self.history = []
+        self.max_steps = 25  # Safety brake to prevent infinite loops
+        # Directory to persist agent steps and outputs
+        self.output_dir = "output"
+        os.makedirs(self.output_dir, exist_ok=True)
 
-    async def reconnaissance_phase(self, target_url: str):
-        logger.info(f"Starting reconnaissance phase for {target_url}")
-        self.scan_start_time = time.time()
-        
-        validation = await self.mcp_server.call_tool("validate_target", {"url": target_url})
-        if not validation.get("valid"): 
-            raise SecurityError("Target validation failed")
+    async def __aenter__(self):
+        """Create the session for the agent."""
+        self.mcp_session = aiohttp.ClientSession()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Close the session for the agent."""
+        if self.mcp_session:
+            await self.mcp_session.close()
+
+    async def _call_mcp_tool(self, tool_name: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Helper method to call the remote MCP server tool."""
+        if not self.mcp_session:
+            raise RuntimeError("Agent session not initialized.")
             
-        domain = urllib.parse.urlparse(target_url).netloc
-        crawl_result = await self.mcp_server.call_tool(
-            "crawl_site",
-            {"seed_url": target_url, "scope_domains": [domain], "depth": 2}  # Limit depth
-        )
-        
-        logger.info(f"Crawl completed: {len(crawl_result.get('endpoints', []))} endpoints, {len(crawl_result.get('forms', []))} forms")
-        
-        self.context = self._analyze_stack(crawl_result)
-        self.attack_plan = self._generate_attack_plan(crawl_result)
-        
-        # Limit total targets
-        total_targets = len(self.attack_plan.get('targets', []))
-        if total_targets > 50:  # Limit total targets
-            self.attack_plan['targets'] = self.attack_plan['targets'][:50]
-            logger.warning(f"Limited targets from {total_targets} to 50 for performance")
-        
-        logger.info(f"Discovered {len(self.attack_plan.get('targets', []))} potential injection points.")
-        return self.attack_plan
-
-    def _analyze_stack(self, crawl_result: Dict[str, Any]):
-        return {
-            "technologies": ["generic"], 
-            "endpoints": crawl_result.get("endpoints", []),
-            "forms": crawl_result.get("forms", [])
-        }
-
-    def _generate_attack_plan(self, crawl_result: Dict[str, Any]):
-        plan = {"targets": [], "vulnerability_types": [v.value for v in VulnType]}
-        
-        # Targets from URL parameters
-        for endpoint in crawl_result.get("endpoints", []):
-            for param in endpoint.get("parameters", []):
-                plan["targets"].append({
-                    "url": endpoint["url"],
-                    "injection_point": {"type": "query_param", "name": param},
-                    "method": endpoint.get("method", "GET")
-                })
-        
-        # Targets from form inputs
-        for form in crawl_result.get("forms", []):
-            for input_field in form.get("inputs", []):
-                plan["targets"].append({
-                    "url": form["action"],
-                    "injection_point": {"type": "form_field", "name": input_field["name"]},
-                    "method": form.get("method", "POST")
-                })    
-        
-        return plan
-    
-    def _check_scan_timeout(self):
-        """Check if scan has exceeded maximum duration"""
-        if self.scan_start_time and time.time() - self.scan_start_time > self.max_scan_duration:
-            raise TimeoutError("Scan exceeded maximum duration")
-    
-    async def test_vulnerability_type(self, vuln_type: str, targets: List[Dict[str, Any]]):
-        logger.info(f"Testing {vuln_type} against {len(targets)} targets")
-        
-        # Limit targets per vulnerability type
-        limited_targets = targets[:self.max_targets_per_vuln]
-        if len(limited_targets) < len(targets):
-            logger.warning(f"Limited {vuln_type} testing from {len(targets)} to {len(limited_targets)} targets")
-        
-        findings = []
-        
-        for i, target in enumerate(limited_targets):
-            try:
-                # Check timeout before each target
-                self._check_scan_timeout()
-                
-                logger.debug(f"Testing {vuln_type} on target {i+1}/{len(limited_targets)}: {target['url']}")
-                
-                target_context = self.context.copy()
-                target_context.update({
-                    "url": target["url"],
-                    "parameter": target["injection_point"]["name"],
-                    "injection_point_type": target["injection_point"]["type"]
-                })
-                
-                payload_result = await self.mcp_server.call_tool("get_payloads", {
-                    "vulnerability_type": vuln_type, 
-                    "context": target_context, 
-                    "count": 3  # Limit payloads per target
-                })
-
-                for payload in payload_result.get("payloads", []):
-                    try:
-                        # Check timeout before each payload
-                        self._check_scan_timeout()
-                        
-                        response = await self.mcp_server.call_tool("inject_payload", {
-                            **target, "payload": payload
-                        })
-                        
-                        if "error" in response:
-                            logger.warning(f"Payload injection failed: {response['error']}")
-                            continue
-                            
-                        analysis = await self.mcp_server.call_tool("analyze_response", {
-                            "request": {"payload": payload}, 
-                            "response": response
-                        })
-
-                        # Add timeout for AI analysis
-                        is_vuln = await asyncio.wait_for(
-                            self.ai_interface.analyze_vulnerability(
-                                {"payload": payload, "target": target}, 
-                                response, 
-                                vuln_type
-                            ),
-                            timeout=30.0
-                        )
-                        
-                        if is_vuln:
-                            finding = await asyncio.wait_for(
-                                self.ai_interface.classify_vulnerability(
-                                    target, payload, analysis, vuln_type
-                                ),
-                                timeout=30.0
-                            )
-                            if finding:
-                                findings.append(finding)
-                                logger.info(f"Potential {vuln_type} vulnerability found in {target['url']}")
-                                
-                    except asyncio.TimeoutError:
-                        logger.warning(f"AI analysis timed out for payload {payload}")
-                        continue
-                    except Exception as e:
-                        logger.warning(f"Error testing payload {payload} on {target['url']}: {e}")
-                        continue
-
-            except TimeoutError:
-                logger.warning("Scan timeout reached, stopping vulnerability testing")
-                break
-            except Exception as e:
-                logger.warning(f"Error testing target {target['url']}: {e}")
-                continue
-
-        logger.info(f"Found {len(findings)} potential {vuln_type} vulnerabilities")
-        return findings
-
-    async def comprehensive_scan(self, target_url: str):
-        logger.info(f"Starting comprehensive scan of {target_url}")
+        url = f"{self.mcp_server_url}/call_tool"
+        request_body = {"tool_name": tool_name, "params": params}
         
         try:
-            attack_plan = await self.reconnaissance_phase(target_url)
-            all_findings = []
-            
-            # Limit vulnerability types tested (for demo, test only first 3)
-            vuln_types_to_test = attack_plan["vulnerability_types"][:3]
-            logger.info(f"Testing {len(vuln_types_to_test)} vulnerability types: {vuln_types_to_test}")
-            
-            for vuln_type in vuln_types_to_test:
-                try:
-                    self._check_scan_timeout()
-                    findings = await self.test_vulnerability_type(vuln_type, attack_plan["targets"])
-                    all_findings.extend(findings)
-                    
-                    for finding in findings:
-                        await self.mcp_server.call_tool("save_finding", {"vulnerability": finding})
-                        
-                except TimeoutError:
-                    logger.warning("Scan timeout reached, stopping comprehensive scan")
-                    break
-                except Exception as e:
-                    logger.error(f"Error testing {vuln_type}: {e}")
-                    continue
-            
-            report = self._generate_report(target_url, all_findings, attack_plan)
-            scan_duration = time.time() - self.scan_start_time
-            logger.info(f"Scan complete in {scan_duration:.1f} seconds. Found {len(all_findings)} potential vulnerabilities")
-            return report
-            
+            # Give tools up to 5 minutes (300s) to run (e.g., for crawling)
+            async with self.mcp_session.post(url, json=request_body, timeout=300.0) as response:
+                if response.status == 200:
+                    return await response.json()
+                else:
+                    error_detail = await response.text()
+                    logger.error(f"MCP server error ({response.status}): {error_detail}")
+                    return {"error": f"MCP Server Error: {response.status}", "detail": error_detail}
         except Exception as e:
-            logger.error(f"Comprehensive scan failed: {e}")
-            return self._generate_error_report(target_url, str(e))
+            logger.error(f"Error calling MCP tool {tool_name}: {e}")
+            return {"error": str(e)}
 
-    def _generate_report(self, target_url: str, findings: List[Dict[str, Any]], attack_plan: Dict[str, Any]):
-        severity_counts = {s.value: 0 for s in Severity}
-        for f in findings:
-            severity = f.get("severity", "info")
-            if severity in severity_counts:
-                severity_counts[severity] += 1
+    async def run_goal(self, goal: str):
+        """
+        Runs the main agent loop to achieve a user-defined goal.
+        """
+        logger.info(f"Agent starting with goal: {goal}")
+        self.history = []  # Reset history for each run
         
-        scan_duration = time.time() - self.scan_start_time if self.scan_start_time else 0
+        for step in range(self.max_steps):
+            logger.info(f"--- Agent Step {step + 1} ---")
+            
+            # 1. Ask the "brain" (LLM) what to do
+            next_step = await self.ai_interface.decide_next_step(goal, self.history)
+            
+            if "final_answer" in next_step:
+                # 4. Goal is complete
+                logger.info("Agent has completed the goal.")
+                # Persist final answer to output directory
+                try:
+                    final_record = {
+                        "step": "final",
+                        "final_answer": next_step["final_answer"],
+                        "timestamp": time.time()
+                    }
+                    final_filename = f"agent_final_{int(final_record['timestamp'] * 1000)}.json"
+                    final_path = os.path.join(self.output_dir, final_filename)
+                    with open(final_path, 'w', encoding='utf-8') as ff:
+                        json.dump(final_record, ff, indent=2, ensure_ascii=False)
+                    logger.info(f"Saved agent final answer to {final_path}")
+                except Exception as e:
+                    logger.error(f"Failed to save final answer to output: {e}")
+
+                print("\n" + "="*80)
+                print("AGENT FINAL REPORT")
+                print("="*80)
+                print(next_step["final_answer"])
+                break
+                
+            if "tool_name" in next_step:
+                # 2. Brain decided to call a tool
+                action = next_step
+                tool_name = action["tool_name"]
+                params = action["params"]
+
+                # Log the agent's thought process
+                if "thought" in action:
+                    logger.info(f"Agent Thought: {action['thought']}")
+                
+                logger.info(f"Agent Action: Calling tool {tool_name} with params: {params}")
+                
+                # 3. Execute the tool call on the "body" (MCP Server)
+                tool_result = await self._call_mcp_tool(tool_name, params)
+                
+                # Truncate large results (like crawl data) for history
+                result_for_history = self._truncate_result(tool_result)
+                
+                logger.info(f"Tool Result (truncated): {json.dumps(result_for_history, indent=2)}")
+                
+                # Add the action and result to history for the next loop
+                self.history.append({"action": action, "result": result_for_history})
+                # Persist the full step (action + full result) to the output directory
+                try:
+                    step_record = {
+                        "step": step + 1,
+                        "action": action,
+                        "result": tool_result,
+                        "timestamp": time.time()
+                    }
+                    step_filename = f"agent_step_{step + 1}_{int(step_record['timestamp'] * 1000)}.json"
+                    step_path = os.path.join(self.output_dir, step_filename)
+                    with open(step_path, 'w', encoding='utf-8') as sf:
+                        json.dump(step_record, sf, indent=2, ensure_ascii=False)
+                    logger.info(f"Saved agent step to {step_path}")
+                except Exception as e:
+                    logger.error(f"Failed to save agent step to output: {e}")
+            else:
+                logger.warning(f"Invalid response from AI: {next_step}")
+                print("Agent reasoning error, stopping.")
+                break
         
-        return {
-            "scan_summary": {
-                "target": target_url, 
-                "timestamp": time.time(),
-                "scan_duration": scan_duration,
-                "total_findings": len(findings), 
-                "severity_breakdown": severity_counts,
-                "risk_score": self._calculate_risk_score(findings),
-                "targets_tested": len(attack_plan.get("targets", [])),
-            },
-            "findings": findings,
-            "attack_surface": {
-                "endpoints_discovered": len(self.context.get("endpoints", [])),
-                "forms_discovered": len(self.context.get("forms", [])),
-                "technologies": self.context.get("technologies", [])
+        if step == self.max_steps - 1:
+            logger.warning("Agent reached maximum steps, stopping.")
+            print("Agent reached maximum steps, stopping.")
+
+    def _truncate_result(self, result: Any, max_length: int = 2000) -> Any:
+        """Truncates large tool results to avoid huge LLM context."""
+        if isinstance(result, dict) and "body" in result:
+             # Truncate response bodies
+             result["body"] = result["body"][:max_length] + "... (truncated)"
+        
+        result_str = json.dumps(result)
+        if len(result_str) > max_length:
+            return {
+                "summary": "Result is too large",
+                "keys": list(result.keys()) if isinstance(result, dict) else "N/A",
+                "note": "Original result truncated to fit context."
             }
-        }
-
-    def _generate_error_report(self, target_url: str, error_message: str):
-        """Generate a report when scan fails"""
-        return {
-            "scan_summary": {
-                "target": target_url,
-                "timestamp": time.time(),
-                "scan_duration": time.time() - self.scan_start_time if self.scan_start_time else 0,
-                "total_findings": 0,
-                "severity_breakdown": {s.value: 0 for s in Severity},
-                "risk_score": 0.0,
-                "error": error_message
-            },
-            "findings": [],
-            "attack_surface": {}
-        }
-
-    def _calculate_risk_score(self, findings: List[Dict[str, Any]]):
-        if not findings: 
-            return 0.0
-        weights = {
-            Severity.CRITICAL.value: 10, 
-            Severity.HIGH.value: 7, 
-            Severity.MEDIUM.value: 4, 
-            Severity.LOW.value: 1, 
-            Severity.INFO.value: 0
-        }
-        score = sum(weights.get(f.get("severity"), 0) * f.get("confidence", 0.5) for f in findings)
-        return min(round(score / (len(findings) * 10) * 10, 1), 10.0) if findings else 0.0
-
+        return result
+    
 # =============================================================================
 # Enhanced Main Execution with better error handling and limits
 # =============================================================================
 
 async def main():
-    target_url = "https://httpbin.org/forms/post"
+    mcp_server_url = "http://127.0.0.1:8000"
     
-    # Set overall timeout for the entire operation
-    overall_timeout = 60  # 10 minutes maximum
+    # === DEFINE YOUR GOAL HERE ===
     
+    # Example 1: A full, comprehensive scan
+    goal = "Validate and perform a comprehensive scan for XSS and SQLi on 'https://httpbin.org/forms/post'. Be thorough. Start by crawling, then test forms and endpoints you find. Report all findings."
+    
+    # Example 2: The intelligent, context-aware request you described
+    # (To run this, run Example 1 first, then restart and run this)
+    #goal = "I've already crawled 'https://httpbin.org/forms/post' and found a form. Just generate 3 good XSS payloads for an input named 'custname' and 'custemail'."
+
+    # Example 3: A simple, single-tool request
+    # goal = "Just get me 2 SQLi payloads for a 'username' parameter."
+
     try:
-        logger.info("Initializing vulnerability scanner...")
+        logger.info("Initializing AI agent...")
         ai_interface = AIInterface()
         
-        async with MCPServer(ai_interface) as mcp_server:
-            # Configure scope validation
-            domain = urllib.parse.urlparse(target_url).netloc
-            mcp_server.scope_validator.allowed_domains = [domain]
+        async with VulnScanAgent(mcp_server_url, ai_interface) as agent:
+            await agent.run_goal(goal)
             
-            # Create agent with limits
-            agent = VulnScanAgent(
-                mcp_server, 
-                ai_interface, 
-                max_targets_per_vuln=5  # Limit targets per vulnerability type
-            )
-            
-            logger.info("Starting vulnerability scan using AI interface...")
-            
-            # Run scan with overall timeout
-            report = await asyncio.wait_for(
-                agent.comprehensive_scan(target_url),
-                timeout=overall_timeout
-            )
-            
-            logger.info("Scan completed. Processing results...")
+    except aiohttp.ClientConnectorError:
+        logger.error(f"Failed to connect to MCP server at {mcp_server_url}. Is it running?")
+        print(f"\nError: Cannot connect to MCP Server at {mcp_server_url}")
+        print("Please ensure the server is running: uvicorn mcp_server_app:app --port 8000")
+    except Exception as e:
+        logger.error(f"Unexpected error in main: {e}", exc_info=True)
 
-            # Display results
-            print("\n" + "="*80)
-            print("VULNERABILITY SCAN REPORT")
-            print("="*80)
-            
-            summary = report['scan_summary']
-            print(f"Target: {summary['target']}")
-            print(f"Scan Duration: {summary.get('scan_duration', 0):.1f} seconds")
-            print(f"Total Findings: {summary['total_findings']}")
-            print(f"Targets Tested: {summary.get('targets_tested', 0)}")
-            print(f"Risk Score: {summary['risk_score']:.1f}/10.0")
-            
-            if summary.get('error'):
-                print(f"Scan Error: {summary['error']}")
-            
-            print("\nSeverity Breakdown:")
-            for severity, count in summary['severity_breakdown'].items():
-                if count > 0: 
-                    print(f"  {severity.upper()}: {count}")
-            
-            attack_surface = report.get('attack_surface', {})
-            print(f"\nAttack Surface:")
-            print(f"  Endpoints Discovered: {attack_surface.get('endpoints_discovered', 0)}")
-            print(f"  Forms Discovered: {attack_surface.get('forms_discovered', 0)}")
-            print(f"  Technologies: {', '.join(attack_surface.get('technologies', ['Unknown']))}")
-            
-            if report['findings']:
-                print("\nTop Vulnerabilities:")
-                for i, finding in enumerate(report['findings'][:5], 1):
-                    title = finding.get('title', 'Untitled Finding')
-                    severity = finding.get('severity', 'unknown').upper()
-                    confidence = finding.get('confidence', 0.0)
-                    confidence_str = f"({confidence:.1%} confidence)" if confidence > 0 else ""
-                    print(f"  {i}. {title} - {severity} {confidence_str}")
-            else:
-                print("\nNo vulnerabilities found.")
-                print("This could be due to:")
-                print("  - Target is well-secured")
-                print("  - Limited scan scope/depth")
-                print("  - AI interface connectivity issues")
-                print("  - Scan timeouts or rate limiting")
+# =============================================================================
+# Plugin System Example
+# =============================================================================
 
     except asyncio.TimeoutError:
         logger.error(f"Scan exceeded maximum time limit of {overall_timeout} seconds")
