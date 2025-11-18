@@ -4,7 +4,7 @@ import re
 import time
 import urllib.parse
 from typing import Dict, List, Any, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from enum import Enum
 import aiohttp
 import logging
@@ -12,6 +12,7 @@ from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
 import hashlib
 import os
+from bs4 import BeautifulSoup
 from src.AIInterface import AIInterface
 
 # Configure logging
@@ -131,6 +132,16 @@ class VulnerabilityDatabase:
 
         data = asdict(vulnerability)
         data['target_url'] = target_url
+
+        # Ensure nested fields are JSON-serializable (location, evidence)
+        try:
+            data['location'] = json.loads(json.dumps(data.get('location', {}), default=str))
+        except Exception:
+            data['location'] = str(data.get('location'))
+        try:
+            data['evidence'] = json.loads(json.dumps(data.get('evidence', {}), default=str))
+        except Exception:
+            data['evidence'] = str(data.get('evidence'))
 
         try:
             with open(file_path, 'w', encoding='utf-8') as f:
@@ -629,35 +640,8 @@ async def main():
         logger.error(f"Unexpected error in main: {e}", exc_info=True)
 
 # =============================================================================
-# Plugin System Example
+# main entry point
 # =============================================================================
-
-    except asyncio.TimeoutError:
-        logger.error(f"Scan exceeded maximum time limit of {overall_timeout} seconds")
-        print(f"\nScan timed out after {overall_timeout} seconds. Consider:")
-        print("  - Reducing scan scope")
-        print("  - Increasing timeout limits")
-        print("  - Checking target responsiveness")
-        
-    except SecurityError as e:
-        logger.error(f"Security constraint violation: {e}")
-        print(f"\nSecurity Error: {e}")
-        print("Check your target URL and scope configuration.")
-        
-    except ValueError as e:
-        logger.error(f"Configuration error: {e}")
-        print(f"\nConfiguration Error: {e}")
-        print("Check your AI interface setup and parameters.")
-        
-    except Exception as e:
-        logger.error(f"Unexpected error during scan: {e}", exc_info=True)
-        print(f"\nUnexpected Error: {e}")
-        print("Check logs for detailed error information.")
-        print("Common issues:")
-        print("  - AI interface not properly configured")
-        print("  - Network connectivity problems")
-        print("  - Target server blocking requests")
-        print("  - Missing dependencies")
 
 if __name__ == "__main__":
     asyncio.run(main())
