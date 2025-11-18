@@ -1,0 +1,5 @@
+output
+src/__pycache__
+src/config.py
+vulnerabilities.db
+__pycache__
