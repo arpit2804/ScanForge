@@ -156,32 +156,51 @@ class VulnerabilityDatabase:
 # =============================================================================
 # PayloadDatabase to use AI
 # =============================================================================
+
 class PayloadDatabase:
-    """Payload database that uses an LLM for context-aware payload generation"""
+    """AI-powered payload database - intelligence over templates"""
     def __init__(self, ai_interface: AIInterface):
         self.ai_interface = ai_interface
-        self.fallback_payloads = {
-            VulnType.XSS.value: ["<script>alert('XSS')</script>", "<img src=x onerror=alert('XSS')>"],
-            VulnType.SQLI.value: ["' OR '1'='1", "'; DROP TABLE users;--"],
+        # Minimal fallbacks only for when AI completely fails
+        self.emergency_fallbacks = {
+            'xss': ["<script>alert(1)</script>", "<img src=x onerror=alert(1)>"],
+            'sqli': ["' OR '1'='1", "1' UNION SELECT NULL--"],
+            'ssrf': ["http://localhost", "http://169.254.169.254"],
+            'lfi': ["../../etc/passwd", "../../../etc/passwd"],
+            'rce': ["; whoami", "| id"],
         }
 
     async def get_payloads(self, vuln_type: str, context: Dict[str, Any] = None, count: int = 10) -> List[str]:
-        if not context:
-            return self.fallback_payloads.get(vuln_type, [])[:count]
+        """
+        Always try AI first - fallbacks are truly last resort.
+        """
         try:
-            # Add timeout for AI payload generation
+            # AI-powered generation
             payloads = await asyncio.wait_for(
                 self.ai_interface.generate_payloads(vuln_type, context, count),
-                timeout=30.0  # 30 second timeout
+                timeout=45.0
             )
-            if payloads:
+            
+            if payloads and len(payloads) > 0:
+                logger.info(f"AI generated {len(payloads)} payloads for {vuln_type}")
                 return payloads
+            else:
+                logger.warning(f"AI returned empty payloads, using emergency fallbacks")
+                
         except asyncio.TimeoutError:
-            logger.warning("AI payload generation timed out. Using fallback payloads.")
+            logger.warning(f"AI payload generation timed out for {vuln_type}")
         except Exception as e:
-            logger.warning(f"AI payload generation failed: {e}. Using fallback payloads.")
-        return self.fallback_payloads.get(vuln_type, [])[:count]
-
+            logger.warning(f"AI payload generation failed: {e}")
+        
+        # Emergency fallback - very basic
+        fallback = self.emergency_fallbacks.get(vuln_type.lower(), [])
+        if not fallback:
+            # Even if vuln_type is unknown, AI should have handled it
+            logger.error(f"No emergency fallback for {vuln_type} and AI failed")
+            return []
+        
+        logger.info(f"Using {len(fallback)} emergency fallback payloads for {vuln_type}")
+        return fallback[:count]
 
 class WebCrawler:
     """Web crawler using BeautifulSoup for robust parsing with limits."""
@@ -317,16 +336,20 @@ class WebCrawler:
 class MCPServer:
     """Main MCP Server handling all vulnerability scanning operations"""
     
-    def __init__(self,ai_interface: AIInterface):
+    def __init__(self, ai_interface: AIInterface):
+        self.ai_interface = ai_interface  # Add this line
         self.rate_limiter = RateLimiter(requests_per_minute=30)
         self.scope_validator = ScopeValidator()
         self.payload_db = PayloadDatabase(ai_interface)
         self.vuln_db = VulnerabilityDatabase()
         self.session = None
         self.tools = {
-            "crawl_site": self.crawl_site, "send_request": self.send_request,
-            "inject_payload": self.inject_payload, "analyze_response": self.analyze_response,
-            "save_finding": self.save_finding, "get_payloads": self.get_payloads,
+            "crawl_site": self.crawl_site, 
+            "send_request": self.send_request,
+            "inject_payload": self.inject_payload, 
+            "analyze_response": self.analyze_response,
+            "save_finding": self.save_finding, 
+            "get_payloads": self.get_payloads,
             "validate_target": self.validate_target,
         }
 
@@ -418,20 +441,44 @@ class MCPServer:
             return {"error": str(e)}
 
     async def analyze_response(self, request: Dict[str, Any], response: Dict[str, Any], **kwargs) -> Dict[str, Any]:
+        """
+        AI-powered response analysis - no hardcoded regex patterns.
+        """
         try:
-            indicators = {}
-            payload = request.get('payload', '')
-            response_body = response.get('body', '')
+            # Use AI for intelligent analysis
+            analysis = await asyncio.wait_for(
+                self.ai_interface.analyze_response_with_ai(request, response),
+                timeout=30.0
+            )
             
-            # Basic analysis
-            indicators['payload_reflection'] = {"found": payload in response_body}
-            sql_error_patterns = [r'SQL syntax.*MySQL', r'Warning.*mysql_', r'ORA-\d+', r'Microsoft.*ODBC.*SQL']
-            indicators['error_disclosure'] = {"found": any(re.search(p, response_body, re.I) for p in sql_error_patterns)}
+            logger.info(f"AI analysis complete: {analysis.get('vulnerability_type', 'none detected')}")
+            return analysis
             
-            return {"indicators": indicators}
+        except asyncio.TimeoutError:
+            logger.warning("AI analysis timed out, using basic fallback")
+            return self._basic_analysis_fallback(request, response)
         except Exception as e:
-            logger.error(f"Response analysis failed: {e}")
-            return {"indicators": {}}
+            logger.error(f"AI analysis failed: {e}")
+            return self._basic_analysis_fallback(request, response)
+
+    def _basic_analysis_fallback(self, request: Dict[str, Any], response: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Ultra-basic fallback when AI completely fails.
+        Just checks if payload is reflected - nothing intelligent.
+        """
+        payload = request.get('payload', '')
+        response_body = response.get('body', '')
+        
+        return {
+            "vulnerability_detected": False,
+            "confidence": 0.1,
+            "indicators": {
+                "payload_reflected": payload in response_body if payload else False,
+                "status_code": response.get('status_code', 0),
+            },
+            "reasoning": "AI analysis unavailable, basic reflection check only",
+            "fallback_mode": True
+        }
 
     async def get_payloads(self, vulnerability_type: str, context: Dict[str, Any] = None, count: int = 10):
         # Limit payload count

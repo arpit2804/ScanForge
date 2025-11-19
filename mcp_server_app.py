@@ -27,11 +27,10 @@ server_instances = {}
 async def lifespan(app: FastAPI):
     """Manages the startup and shutdown of the MCPServer."""
     print("Starting up...")
-    ai_interface = AIInterface()
-    mcp_server = MCPServer(ai_interface)
+    ai_interface = AIInterface()  # Create AIInterface instance
+    mcp_server = MCPServer(ai_interface)  # Pass it to MCPServer
     
     # Manually enter the async context of the mcp_server
-    # This calls its __aenter__ method, creating the aiohttp.ClientSession
     await mcp_server.__aenter__()
     
     server_instances['mcp_server'] = mcp_server
@@ -40,7 +39,7 @@ async def lifespan(app: FastAPI):
     # On shutdown, call the __aexit__ method to clean up
     print("Shutting down...")
     await mcp_server.__aexit__(None, None, None)
-
+    
 app = FastAPI(lifespan=lifespan)
 
 @app.post("/call_tool")
