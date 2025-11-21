@@ -1,3 +1,4 @@
+```md
 # ScanForge
 
 **AI-Powered Vulnerability Scanner with Model Context Protocol (MCP)**
@@ -51,14 +52,12 @@ ScanForge is an intelligent vulnerability scanning system that leverages Large L
 ## 🚀 Installation
 
 1. **Clone the repository:**
-
 ```bash
 git clone <repository-url>
 cd ScanForge
 ```
 
 2. **Install dependencies:**
-
 ```bash
 pip install -r requirements.txt
 ```
@@ -71,7 +70,7 @@ Create a `src/config.py` file with your Groq API key:
 import os
 
 # =============================================================================
-# Groq LLM API Configuration
+# Groq LLM API Configuration 
 # =============================================================================
 
 # Your Groq API key - get one from https://console.groq.com/
@@ -89,7 +88,6 @@ REQUESTS_PER_MINUTE = 30
 ```
 
 **Alternative:** Set environment variables instead:
-
 ```bash
 export GROQ_API_KEY="your-api-key-here"
 export GROQ_MODEL="llama-3.3-70b-versatile"
@@ -102,7 +100,6 @@ export GROQ_MODEL="llama-3.3-70b-versatile"
 Create a startup script to run both servers:
 
 **For Linux/Mac (`start.sh`):**
-
 ```bash
 #!/bin/bash
 
@@ -135,14 +132,12 @@ wait
 ```
 
 Make it executable and run:
-
 ```bash
 chmod +x start.sh
 ./start.sh
 ```
 
 **For Windows (`start.bat`):**
-
 ```batch
 @echo off
 echo Starting ScanForge...
@@ -166,7 +161,6 @@ echo Press Ctrl+C in each window to stop
 ```
 
 Run it:
-
 ```batch
 start.bat
 ```
@@ -174,19 +168,16 @@ start.bat
 ### Option 2: Running Servers Independently
 
 **Terminal 1 - Start MCP Server:**
-
 ```bash
 uvicorn mcp_server_app:app --host 127.0.0.1 --port 8000
 ```
 
 **Terminal 2 - Start Chat Server:**
-
 ```bash
 uvicorn chat_server:app --host 0.0.0.0 --port 8001
 ```
 
 **Terminal 3 - Open Web UI:**
-
 ```bash
 # Open index.html in your browser
 # Or use a simple HTTP server:
@@ -220,7 +211,6 @@ goal = "Just get me 3 SQLi payloads for a 'username' parameter"
 ```
 
 Then run:
-
 ```bash
 python -m src.main
 ```
@@ -246,7 +236,6 @@ ScanForge/
 ## 🎓 Example Workflows
 
 ### 1. Full Security Assessment
-
 ```
 "Perform a comprehensive security assessment on https://testsite.com including:
 1. Crawl the site to discover endpoints
@@ -256,7 +245,6 @@ ScanForge/
 ```
 
 ### 2. Targeted Testing
-
 ```
 "Test the login form at https://example.com/login for:
 - SQL injection in username/password
@@ -265,7 +253,6 @@ Use 5 payloads for each vulnerability type"
 ```
 
 ### 3. Payload Generation
-
 ```
 "Generate 10 advanced XSS payloads that:
 - Bypass common WAF filters
@@ -325,7 +312,6 @@ Edit `src/config.py` to customize:
 - `REQUESTS_PER_MINUTE`: Rate limiting threshold
 
 Adjust in code:
-
 - **Crawl depth**: `depth` parameter in `crawl_site` (default: 2, max: 3)
 - **Max payloads**: `count` parameter in `get_payloads` (default: 10, max: 50)
 - **Timeout values**: Various timeout parameters in `main.py`
@@ -343,7 +329,6 @@ Contributions are welcome! Areas for improvement:
 ## ⚠️ Legal Disclaimer
 
 **IMPORTANT**: This tool is intended for:
-
 - Testing systems you own
 - Authorized penetration testing engagements
 - Educational purposes in controlled environments
@@ -363,3 +348,4 @@ Contributions are welcome! Areas for improvement:
 ---
 
 **Happy (Authorized) Hacking! 🔐**
+```
