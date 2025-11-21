@@ -86,7 +86,7 @@ class ChatSession:
                 return response
             
             # Execute tool calls until we get a final answer or hit max iterations
-            max_iterations = 5
+            max_iterations = 100
             iteration = 0
             
             while iteration < max_iterations:

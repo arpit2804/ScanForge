@@ -519,7 +519,7 @@ class VulnScanAgent:
         self.mcp_server_url = mcp_server_url
         self.mcp_session = None
         self.history = []
-        self.max_steps = 25  # Safety brake to prevent infinite loops
+        self.max_steps = 100  # Safety brake to prevent infinite loops
         # Directory to persist agent steps and outputs
         self.output_dir = "output"
         os.makedirs(self.output_dir, exist_ok=True)

@@ -147,7 +147,6 @@ class AIInterface:
         The AI understands context and makes intelligent judgments.
         """
         system_prompt = """You are an expert security analyst specializing in vulnerability detection.
-
     Your role:
     - Analyze HTTP responses for signs of security vulnerabilities
     - Consider the context of the request and payload used
@@ -159,8 +158,6 @@ class AIInterface:
     2. Look for error messages that leak information
     3. Consider timing anomalies (blind vulnerabilities)
     4. Check for behavioral changes
-    5. Detect encoding/filtering bypasses
-    6. Consider the application's response patterns
 
     Output Format:
     Return a JSON object with your analysis.
@@ -184,8 +181,8 @@ class AIInterface:
         
         response_body = response.get('body', '')
         # Truncate large responses but keep key parts
-        if len(response_body) > 5000:
-            response_body_sample = response_body[:2500] + "\n...[truncated]...\n" + response_body[-2500:]
+        if len(response_body) > 6000:
+            response_body_sample = response_body[:3000] + "\n...[truncated]...\n" + response_body[-3000:]
         else:
             response_body_sample = response_body
         
