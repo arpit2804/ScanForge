@@ -1,17 +1,23 @@
-ScanForge
-AI-Powered Vulnerability Scanner with Model Context Protocol (MCP)
+```md
+# ScanForge
+
+**AI-Powered Vulnerability Scanner with Model Context Protocol (MCP)**
+
 ScanForge is an intelligent vulnerability scanning system that leverages Large Language Models (LLMs) to perform context-aware security testing. Unlike traditional scanners with hardcoded patterns, ScanForge uses AI reasoning to generate adaptive payloads, analyze responses intelligently, and orchestrate comprehensive security assessments.
-🌟 Key Features
 
-AI-Powered Intelligence: Uses Groq LLMs for dynamic payload generation and intelligent vulnerability detection
-MCP Architecture: Clean separation between AI reasoning (agent) and scanning operations (MCP server)
-Context-Aware Testing: Generates payloads based on target context (frameworks, parameters, input types)
-Adaptive Analysis: AI-driven response analysis that understands subtle vulnerability indicators
-Built-in Safety: Rate limiting, scope validation, and dangerous payload detection
-Web Interface: Modern chat-based UI for interactive security testing
-Comprehensive Crawling: Automatic discovery of endpoints, forms, and attack surface
+## 🌟 Key Features
 
-🏗️ Architecture
+- **AI-Powered Intelligence**: Uses Groq LLMs for dynamic payload generation and intelligent vulnerability detection
+- **MCP Architecture**: Clean separation between AI reasoning (agent) and scanning operations (MCP server)
+- **Context-Aware Testing**: Generates payloads based on target context (frameworks, parameters, input types)
+- **Adaptive Analysis**: AI-driven response analysis that understands subtle vulnerability indicators
+- **Built-in Safety**: Rate limiting, scope validation, and dangerous payload detection
+- **Web Interface**: Modern chat-based UI for interactive security testing
+- **Comprehensive Crawling**: Automatic discovery of endpoints, forms, and attack surface
+
+## 🏗️ Architecture
+
+```
 ┌─────────────────┐         ┌──────────────────┐         ┌─────────────────┐
 │   Web UI        │────────>│  Chat Server     │────────>│  VulnScanAgent  │
 │  (index.html)   │         │  (Port 8001)     │         │  (AI Brain)     │
@@ -35,27 +41,33 @@ Comprehensive Crawling: Automatic discovery of endpoints, forms, and attack surf
                                                           │  - Analysis     │
                                                           │  - Storage      │
                                                           └─────────────────┘
-📋 Prerequisites
+```
 
-Python 3.8+
-A Groq API key (free tier available)
-Basic understanding of web security concepts
+## 📋 Prerequisites
 
-🚀 Installation
+- Python 3.8+
+- A [Groq API key](https://console.groq.com/) (free tier available)
+- Basic understanding of web security concepts
 
-Clone the repository:
+## 🚀 Installation
 
-bashgit clone <repository-url>
+1. **Clone the repository:**
+```bash
+git clone <repository-url>
 cd ScanForge
+```
 
-Install dependencies:
+2. **Install dependencies:**
+```bash
+pip install -r requirements.txt
+```
 
-bashpip install -r requirements.txt
+3. **Configure API credentials:**
 
-Configure API credentials:
+Create a `src/config.py` file with your Groq API key:
 
-Create a src/config.py file with your Groq API key:
-pythonimport os
+```python
+import os
 
 # =============================================================================
 # Groq LLM API Configuration 
@@ -73,14 +85,23 @@ GROQ_MODEL = "llama-3.3-70b-versatile"
 # =============================================================================
 
 REQUESTS_PER_MINUTE = 30
-Alternative: Set environment variables instead:
-bashexport GROQ_API_KEY="your-api-key-here"
+```
+
+**Alternative:** Set environment variables instead:
+```bash
+export GROQ_API_KEY="your-api-key-here"
 export GROQ_MODEL="llama-3.3-70b-versatile"
-🎯 Running ScanForge
-Option 1: Using Startup Script (Recommended)
+```
+
+## 🎯 Running ScanForge
+
+### Option 1: Using Startup Script (Recommended)
+
 Create a startup script to run both servers:
-For Linux/Mac (start.sh):
-bash#!/bin/bash
+
+**For Linux/Mac (`start.sh`):**
+```bash
+#!/bin/bash
 
 echo "Starting ScanForge..."
 echo "===================="
@@ -108,11 +129,17 @@ echo "To stop: kill $MCP_PID $CHAT_PID"
 
 # Wait for both processes
 wait
+```
+
 Make it executable and run:
-bashchmod +x start.sh
+```bash
+chmod +x start.sh
 ./start.sh
-For Windows (start.bat):
-batch@echo off
+```
+
+**For Windows (`start.bat`):**
+```batch
+@echo off
 echo Starting ScanForge...
 echo ====================
 
@@ -131,33 +158,49 @@ echo 💬 Chat Server: http://localhost:8001
 echo 🌐 Web UI: Open index.html in your browser
 echo.
 echo Press Ctrl+C in each window to stop
+```
+
 Run it:
-batchstart.bat
-Option 2: Running Servers Independently
-Terminal 1 - Start MCP Server:
-bashuvicorn mcp_server_app:app --host 127.0.0.1 --port 8000
-Terminal 2 - Start Chat Server:
-bashuvicorn chat_server:app --host 0.0.0.0 --port 8001
-Terminal 3 - Open Web UI:
-bash# Open index.html in your browser
+```batch
+start.bat
+```
+
+### Option 2: Running Servers Independently
+
+**Terminal 1 - Start MCP Server:**
+```bash
+uvicorn mcp_server_app:app --host 127.0.0.1 --port 8000
+```
+
+**Terminal 2 - Start Chat Server:**
+```bash
+uvicorn chat_server:app --host 0.0.0.0 --port 8001
+```
+
+**Terminal 3 - Open Web UI:**
+```bash
+# Open index.html in your browser
 # Or use a simple HTTP server:
 python -m http.server 8080
 # Then navigate to: http://localhost:8080/index.html
-💻 Usage
-Web Interface
+```
 
-Open index.html in your browser
-Start a conversation with example commands:
+## 💻 Usage
 
-"Scan https://httpbin.org/forms/post for XSS"
-"Generate 5 SQL injection payloads for a login form"
-"Crawl https://example.com and find forms"
+### Web Interface
 
+1. Open `index.html` in your browser
+2. Start a conversation with example commands:
+   - "Scan https://httpbin.org/forms/post for XSS"
+   - "Generate 5 SQL injection payloads for a login form"
+   - "Crawl https://example.com and find forms"
 
+### Programmatic Usage
 
-Programmatic Usage
-Edit the goal in src/main.py and run:
-python# Example: Comprehensive scan
+Edit the goal in `src/main.py` and run:
+
+```python
+# Example: Comprehensive scan
 goal = "Validate and perform a comprehensive scan for XSS and SQLi on 'https://httpbin.org/forms/post'. Be thorough."
 
 # Example: Intelligent payload generation
@@ -165,11 +208,15 @@ goal = "Generate 5 context-aware XSS payloads for an email input field in a Reac
 
 # Example: Simple request
 goal = "Just get me 3 SQLi payloads for a 'username' parameter"
+```
+
 Then run:
-bashpython -m src.main
+```bash
+python -m src.main
 ```
 
 ## 📁 Project Structure
+
 ```
 ScanForge/
 ├── src/
@@ -211,17 +258,22 @@ Use 5 payloads for each vulnerability type"
 - Bypass common WAF filters
 - Target modern frameworks like React
 - Include polyglot variants"
-🔒 Safety Features
+```
 
-Scope Validation: Ensures testing stays within allowed domains
-Rate Limiting: Prevents overwhelming target servers (30 req/min default)
-Dangerous Payload Detection: Blocks destructive operations
-Request Timeouts: Prevents hanging operations
-Crawl Limits: Max depth and page limits to prevent infinite crawling
+## 🔒 Safety Features
 
-📊 Output
-Findings are saved to the output/ directory as JSON files:
-json{
+- **Scope Validation**: Ensures testing stays within allowed domains
+- **Rate Limiting**: Prevents overwhelming target servers (30 req/min default)
+- **Dangerous Payload Detection**: Blocks destructive operations
+- **Request Timeouts**: Prevents hanging operations
+- **Crawl Limits**: Max depth and page limits to prevent infinite crawling
+
+## 📊 Output
+
+Findings are saved to the `output/` directory as JSON files:
+
+```json
+{
   "type": "xss",
   "severity": "high",
   "title": "Reflected XSS in search parameter",
@@ -237,47 +289,63 @@ json{
   "confidence": 0.95,
   "timestamp": 1234567890
 }
-🧪 Evaluation
+```
+
+## 🧪 Evaluation
+
 Test the AI components:
-bash# Test vulnerability analysis accuracy
+
+```bash
+# Test vulnerability analysis accuracy
 python evaluate_analysis.py
 
 # Test payload safety
 python evaluate_payload_safety.py
-⚙️ Configuration Options
-Edit src/config.py to customize:
+```
 
-GROQ_API_KEY: Your API key
-GROQ_MODEL: LLM model to use
-REQUESTS_PER_MINUTE: Rate limiting threshold
+## ⚙️ Configuration Options
+
+Edit `src/config.py` to customize:
+
+- `GROQ_API_KEY`: Your API key
+- `GROQ_MODEL`: LLM model to use
+- `REQUESTS_PER_MINUTE`: Rate limiting threshold
 
 Adjust in code:
+- **Crawl depth**: `depth` parameter in `crawl_site` (default: 2, max: 3)
+- **Max payloads**: `count` parameter in `get_payloads` (default: 10, max: 50)
+- **Timeout values**: Various timeout parameters in `main.py`
 
-Crawl depth: depth parameter in crawl_site (default: 2, max: 3)
-Max payloads: count parameter in get_payloads (default: 10, max: 50)
-Timeout values: Various timeout parameters in main.py
+## 🤝 Contributing
 
-🤝 Contributing
 Contributions are welcome! Areas for improvement:
 
-Additional vulnerability types
-Enhanced AI prompts
-More sophisticated crawling logic
-Export formats (PDF, HTML reports)
-Integration with CI/CD pipelines
+- Additional vulnerability types
+- Enhanced AI prompts
+- More sophisticated crawling logic
+- Export formats (PDF, HTML reports)
+- Integration with CI/CD pipelines
 
-⚠️ Legal Disclaimer
-IMPORTANT: This tool is intended for:
+## ⚠️ Legal Disclaimer
 
-Testing systems you own
-Authorized penetration testing engagements
-Educational purposes in controlled environments
+**IMPORTANT**: This tool is intended for:
+- Testing systems you own
+- Authorized penetration testing engagements
+- Educational purposes in controlled environments
 
-Unauthorized testing is illegal. Always obtain explicit written permission before testing any system you don't own.
-📝 License
+**Unauthorized testing is illegal.** Always obtain explicit written permission before testing any system you don't own.
+
+## 📝 License
+
 [Add your license here]
-🙏 Acknowledgments
 
-Built with Groq for fast LLM inference
-Uses FastAPI for server components
-Inspired by the Model Context Protocol architecture
+## 🙏 Acknowledgments
+
+- Built with [Groq](https://groq.com/) for fast LLM inference
+- Uses [FastAPI](https://fastapi.tiangolo.com/) for server components
+- Inspired by the Model Context Protocol architecture
+
+---
+
+**Happy (Authorized) Hacking! 🔐**
+```
