@@ -307,6 +307,42 @@ class AIInterface:
                     "url": "str (required)",
                     "scope_rules": "dict (optional)"
                 }
+            },
+            {
+                "name": "adaptive_scan",
+                "description": """Runs an adaptive payload-budget scan on a single endpoint.
+            Automatically determines how many payloads to test based on endpoint complexity
+            and stops early when confidence stabilises. Returns findings, confidence history,
+            and anomaly signals. Prefer this over manual inject_payload loops.""",
+                "parameters": {
+                    "endpoint": "dict (required, an endpoint object from crawl_site or get_attack_graph)",
+                    "vulnerability_type": "str (required, e.g. 'xss', 'sqli')"
+                }
+            },
+            {
+                "name": "get_attack_graph",
+                "description": """Returns the risk-scored attack surface graph built from the last crawl.
+            Use this AFTER crawl_site to get a prioritised list of endpoints to test.
+            The graph scores each endpoint by parameter semantics, HTTP method, file uploads, etc.""",
+                "parameters": {
+                    "top_n": "int (optional, default 20, number of top endpoints to return)",
+                    "min_risk": "float (optional, default 0.5, minimum risk score filter)"
+                }
+            },
+            {
+                "name": "get_anomaly_report",
+                "description": "Returns a summary of all behavioral anomalies detected during the current session. Call after scanning to surface zero-day or logic-flaw indicators.",
+                "parameters": {}
+            },
+            {
+                "name": "detect_waf",
+                "description": """Probes a target URL with known WAF-triggering strings to determine
+            whether a Web Application Firewall is present. Returns vendor identification and
+            per-probe block results. Call this before scanning so the agent can decide
+            whether to use WAF-evasion payloads.""",
+                "parameters": {
+                    "url": "str (required, base URL to probe)"
+                }
             }
         ]
 
